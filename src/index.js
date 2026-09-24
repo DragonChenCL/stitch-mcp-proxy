@@ -265,8 +265,25 @@ export default {
       );
     }
 
+    // A normal browser navigation uses GET + Accept: text/html. Do not forward
+    // that to Google's MCP endpoint (which may return 405); return a safe
+    // diagnostic response instead. Real MCP GET/SSE requests still proxy.
+    if (request.method === "GET" && isBrowserNavigation(request)) {
+      return jsonResponse({
+        ok: true,
+        service: "stitch-mcp-proxy",
+        version: PROXY_VERSION,
+        endpoint: "/mcp",
+        authenticated: true,
+        message:
+          "MCP endpoint is reachable and the token is valid. Use an MCP client to connect; browser navigation is only a connectivity check.",
+        localTools: LOCAL_TOOLS.map((tool) => tool.name)
+      });
+    }
+
     // Streamable HTTP MCP may use GET/DELETE for session operations.
-    // Only POST JSON-RPC requests need inspection; everything else is proxied.
+    // Only POST JSON-RPC requests need inspection; non-browser GET/DELETE
+    // requests are proxied to the upstream MCP server.
     if (request.method !== "POST") {
       return proxyRawToStitch(request, env, apiKey);
     }
@@ -1325,6 +1342,22 @@ function stitchApiBaseUrl(env) {
 
 function getStitchApiKey(request, env) {
   return env.STITCH_API_KEY || request.headers.get("x-goog-api-key") || "";
+}
+
+function isBrowserNavigation(request) {
+  const accept = (request.headers.get("accept") || "").toLowerCase();
+  const secFetchMode = (
+    request.headers.get("sec-fetch-mode") || ""
+  ).toLowerCase();
+  const secFetchDest = (
+    request.headers.get("sec-fetch-dest") || ""
+  ).toLowerCase();
+
+  return (
+    accept.includes("text/html") ||
+    secFetchMode === "navigate" ||
+    secFetchDest === "document"
+  );
 }
 
 function isMcpPath(pathname) {
