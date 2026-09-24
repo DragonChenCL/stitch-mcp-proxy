@@ -200,13 +200,34 @@ export default {
       });
     }
 
+    if (url.pathname === "/selftest") {
+      if (!isAuthorized(request, env)) {
+        return jsonResponse({ error: "Unauthorized" }, 401);
+      }
+
+      const apiKey = getStitchApiKey(request, env);
+      if (!apiKey) {
+        return jsonResponse(
+          {
+            error: "Missing Stitch API key",
+            hint:
+              "Set Cloudflare secret STITCH_API_KEY, or send X-Goog-Api-Key in the request."
+          },
+          500
+        );
+      }
+
+      return handleSelfTest(env, apiKey);
+    }
+
     if (url.pathname !== "/mcp") {
       return new Response(
         [
           "stitch-mcp-proxy",
           "",
           "MCP endpoint: POST/GET/DELETE /mcp",
-          "Health:       GET /health"
+          "Health:       GET /health",
+          "Self-test:    GET /selftest"
         ].join("\n"),
         {
           status: 200,
@@ -272,6 +293,117 @@ export default {
     return proxyRawToStitch(request, env, apiKey, rawBody);
   }
 };
+
+async function handleSelfTest(env, apiKey) {
+  const protocolVersion = "2025-06-18";
+  const initializePayload = {
+    jsonrpc: "2.0",
+    id: "selftest-init",
+    method: "initialize",
+    params: {
+      protocolVersion,
+      capabilities: {},
+      clientInfo: {
+        name: "stitch-mcp-proxy-selftest",
+        version: PROXY_VERSION
+      }
+    }
+  };
+
+  const initResponse = await fetch(stitchMcpUrl(env), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "x-goog-api-key": apiKey
+    },
+    body: JSON.stringify(initializePayload)
+  });
+  const sessionId = initResponse.headers.get("mcp-session-id");
+  const initContentType = initResponse.headers.get("content-type") || "";
+  const initialized = await parseJsonRpcResponse(initResponse);
+
+  if (!initialized.rpc || initialized.rpc.error) {
+    return jsonResponse(
+      {
+        ok: false,
+        version: PROXY_VERSION,
+        stage: "initialize",
+        httpStatus: initResponse.status,
+        contentType: initContentType,
+        error: initialized.rpc?.error || truncate(initialized.raw, 1000)
+      },
+      502
+    );
+  }
+
+  const toolsPayload = {
+    jsonrpc: "2.0",
+    id: "selftest-tools",
+    method: "tools/list",
+    params: {}
+  };
+  const headers = {
+    "content-type": "application/json",
+    accept: "application/json, text/event-stream",
+    "x-goog-api-key": apiKey,
+    "mcp-protocol-version":
+      initialized.rpc?.result?.protocolVersion || protocolVersion
+  };
+  if (sessionId) headers["mcp-session-id"] = sessionId;
+
+  const toolsResponse = await fetch(stitchMcpUrl(env), {
+    method: "POST",
+    headers,
+    body: JSON.stringify(toolsPayload)
+  });
+  const toolsContentType = toolsResponse.headers.get("content-type") || "";
+  const toolsParsed = await parseJsonRpcResponse(toolsResponse);
+
+  if (!toolsParsed.rpc || toolsParsed.rpc.error) {
+    return jsonResponse(
+      {
+        ok: false,
+        version: PROXY_VERSION,
+        stage: "tools/list",
+        httpStatus: toolsResponse.status,
+        contentType: toolsContentType,
+        sessionIdPresent: Boolean(sessionId),
+        error: toolsParsed.rpc?.error || truncate(toolsParsed.raw, 1000)
+      },
+      502
+    );
+  }
+
+  const upstreamTools = Array.isArray(toolsParsed.rpc?.result?.tools)
+    ? toolsParsed.rpc.result.tools
+    : [];
+  const localNames = new Set(LOCAL_TOOLS.map((tool) => tool.name));
+  const mergedTools = [
+    ...LOCAL_TOOLS,
+    ...upstreamTools.filter((tool) => !localNames.has(tool?.name))
+  ];
+
+  return jsonResponse({
+    ok: true,
+    version: PROXY_VERSION,
+    sessionIdPresent: Boolean(sessionId),
+    initialize: {
+      httpStatus: initResponse.status,
+      contentType: initContentType,
+      upstreamServerInfo: initialized.rpc?.result?.serverInfo || null
+    },
+    toolsList: {
+      httpStatus: toolsResponse.status,
+      contentType: toolsContentType,
+      upstreamToolCount: upstreamTools.length,
+      localToolCount: LOCAL_TOOLS.length,
+      mergedToolCount: mergedTools.length,
+      localTools: LOCAL_TOOLS.map((tool) => tool.name),
+      mergedTools: mergedTools.map((tool) => tool?.name).filter(Boolean)
+    }
+  });
+}
 
 async function handleInitialize(request, env, apiKey, rawBody) {
   const upstream = await fetchStitch(request, env, apiKey, rawBody);
