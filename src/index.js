@@ -19,8 +19,11 @@
  *   X-Goog-Api-Key header will still be accepted and forwarded.
  */
 
+const PROXY_VERSION = "2026-09-24-image-bridge-v2";
 const DEFAULT_STITCH_MCP_URL = "https://stitch.googleapis.com/mcp";
+const DEFAULT_STITCH_API_URL = "https://stitch.googleapis.com";
 const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const DEFAULT_UPSTREAM_RPC_TIMEOUT_MS = 15_000;
 
 const LOCAL_TOOLS = [
   {
@@ -110,6 +113,68 @@ const LOCAL_TOOLS = [
       required: ["url"],
       additionalProperties: false
     }
+  },
+  {
+    name: "upload_stitch_image_from_url",
+    description:
+      "Upload a PNG, JPEG, or WEBP image from a public HTTPS URL into a Stitch project as a new image screen.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: {
+          type: "string",
+          description: "Bare Stitch project ID, without the projects/ prefix."
+        },
+        url: {
+          type: "string",
+          description: "Public HTTPS URL of a PNG, JPEG, or WEBP image."
+        },
+        title: {
+          type: "string",
+          description: "Optional title for the created Stitch screen."
+        },
+        createScreenInstances: {
+          type: "boolean",
+          description:
+            "Whether to add the new screen to the project canvas. Defaults to true."
+        }
+      },
+      required: ["projectId", "url"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "upload_stitch_image",
+    description:
+      "Upload PNG, JPEG, or WEBP image bytes encoded as base64 into a Stitch project as a new image screen. Prefer upload_stitch_image_from_url when a public URL is available.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: {
+          type: "string",
+          description: "Bare Stitch project ID, without the projects/ prefix."
+        },
+        fileContentBase64: {
+          type: "string",
+          description: "Base64-encoded image bytes, without a data: URL prefix."
+        },
+        mimeType: {
+          type: "string",
+          enum: ["image/png", "image/jpeg", "image/webp"]
+        },
+        title: {
+          type: "string",
+          description: "Optional title for the created Stitch screen."
+        },
+        createScreenInstances: {
+          type: "boolean",
+          description:
+            "Whether to add the new screen to the project canvas. Defaults to true."
+        }
+      },
+      required: ["projectId", "fileContentBase64", "mimeType"],
+      additionalProperties: false
+    }
   }
 ];
 
@@ -125,7 +190,9 @@ export default {
       return jsonResponse({
         ok: true,
         service: "stitch-mcp-proxy",
+        version: PROXY_VERSION,
         upstream: stitchMcpUrl(env),
+        apiBase: stitchApiBaseUrl(env),
         stitchApiKeyConfigured: Boolean(env.STITCH_API_KEY),
         bridgeKeyConfigured: Boolean(env.BRIDGE_KEY),
         localTools: LOCAL_TOOLS.map((x) => x.name),
@@ -187,6 +254,10 @@ export default {
       return proxyRawToStitch(request, env, apiKey, rawBody);
     }
 
+    if (rpc.method === "initialize") {
+      return handleInitialize(request, env, apiKey, rawBody);
+    }
+
     if (rpc.method === "tools/list") {
       return handleToolsList(request, env, apiKey, rawBody);
     }
@@ -202,33 +273,95 @@ export default {
   }
 };
 
-async function handleToolsList(request, env, apiKey, rawBody) {
+async function handleInitialize(request, env, apiKey, rawBody) {
   const upstream = await fetchStitch(request, env, apiKey, rawBody);
   const parsed = await parseJsonRpcResponse(upstream);
 
   if (!parsed.rpc) {
-    // If Google changes its transport format, fail safe: return upstream untouched.
-    return new Response(parsed.raw, {
-      status: upstream.status,
-      headers: copyResponseHeaders(upstream.headers)
+    const requestRpc = safeParseJson(rawBody);
+    return jsonResponse({
+      jsonrpc: "2.0",
+      id: requestRpc?.id ?? null,
+      result: {
+        protocolVersion: requestRpc?.params?.protocolVersion || "2025-06-18",
+        capabilities: { tools: {} },
+        serverInfo: {
+          name: "stitch-mcp-proxy",
+          version: PROXY_VERSION
+        },
+        instructions:
+          "Google Stitch MCP proxied through stitch-mcp-proxy with image download, inspection, and upload bridge tools."
+      }
     });
   }
 
   if (!parsed.rpc.result) parsed.rpc.result = {};
-  if (!Array.isArray(parsed.rpc.result.tools)) parsed.rpc.result.tools = [];
+  const upstreamServerInfo = parsed.rpc.result.serverInfo || null;
+  parsed.rpc.result.serverInfo = {
+    name: "stitch-mcp-proxy",
+    title: "Stitch MCP Proxy + Image Bridge",
+    version: PROXY_VERSION
+  };
+  parsed.rpc.result._meta = {
+    ...(parsed.rpc.result._meta || {}),
+    proxyVersion: PROXY_VERSION,
+    upstreamServerInfo
+  };
 
-  const existing = new Set(parsed.rpc.result.tools.map((tool) => tool?.name));
-  for (const tool of LOCAL_TOOLS) {
-    if (!existing.has(tool.name)) parsed.rpc.result.tools.push(tool);
+  return jsonRpcResponse(parsed.rpc, upstream.status);
+}
+
+async function handleToolsList(request, env, apiKey, rawBody) {
+  const requestRpc = safeParseJson(rawBody);
+
+  try {
+    const upstream = await fetchStitch(request, env, apiKey, rawBody);
+    const parsed = await parseJsonRpcResponse(upstream);
+
+    if (!parsed.rpc) {
+      return localToolsFallbackResponse(
+        requestRpc?.id ?? null,
+        "Could not parse upstream tools/list response"
+      );
+    }
+
+    if (!parsed.rpc.result) parsed.rpc.result = {};
+    const upstreamTools = Array.isArray(parsed.rpc.result.tools)
+      ? parsed.rpc.result.tools
+      : [];
+
+    const localNames = new Set(LOCAL_TOOLS.map((tool) => tool.name));
+    parsed.rpc.result.tools = [
+      ...LOCAL_TOOLS,
+      ...upstreamTools.filter((tool) => !localNames.has(tool?.name))
+    ];
+    parsed.rpc.result._meta = {
+      ...(parsed.rpc.result._meta || {}),
+      proxyVersion: PROXY_VERSION,
+      localTools: LOCAL_TOOLS.map((tool) => tool.name)
+    };
+
+    return jsonRpcResponse(parsed.rpc, upstream.status);
+  } catch (error) {
+    return localToolsFallbackResponse(
+      requestRpc?.id ?? null,
+      error instanceof Error ? error.message : String(error)
+    );
   }
+}
 
-  const headers = copyResponseHeaders(upstream.headers);
-  headers.set("content-type", "application/json; charset=utf-8");
-  headers.delete("content-length");
-
-  return new Response(JSON.stringify(parsed.rpc), {
-    status: upstream.status,
-    headers
+function localToolsFallbackResponse(id, reason) {
+  return jsonResponse({
+    jsonrpc: "2.0",
+    id,
+    result: {
+      tools: LOCAL_TOOLS,
+      _meta: {
+        proxyVersion: PROXY_VERSION,
+        upstreamToolsUnavailable: true,
+        reason: truncate(reason, 500)
+      }
+    }
   });
 }
 
@@ -249,6 +382,78 @@ async function handleLocalTool(request, env, apiKey, rpc) {
         {
           type: "text",
           text: JSON.stringify(inspectImage(asset), null, 2)
+        }
+      ]);
+    }
+
+    if (name === "upload_stitch_image_from_url") {
+      const projectId = requireBareId(args.projectId, "projectId");
+      const asset = await fetchRemoteUploadImage(args.url, env);
+      const uploaded = await uploadImageToStitch(
+        env,
+        apiKey,
+        projectId,
+        bytesToBase64(asset.bytes),
+        asset.mimeType,
+        {
+          title: args.title,
+          createScreenInstances: args.createScreenInstances
+        }
+      );
+
+      return rpcToolSuccess(id, [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              ok: true,
+              projectId,
+              sourceUrl: asset.finalUrl,
+              mimeType: asset.mimeType,
+              bytes: asset.bytes.byteLength,
+              ...uploaded
+            },
+            null,
+            2
+          )
+        }
+      ]);
+    }
+
+    if (name === "upload_stitch_image") {
+      const projectId = requireBareId(args.projectId, "projectId");
+      const mimeType = normalizeUploadMime(args.mimeType);
+      const bytes = decodeAndValidateUploadBase64(
+        args.fileContentBase64,
+        mimeType,
+        env
+      );
+      const uploaded = await uploadImageToStitch(
+        env,
+        apiKey,
+        projectId,
+        bytesToBase64(bytes),
+        mimeType,
+        {
+          title: args.title,
+          createScreenInstances: args.createScreenInstances
+        }
+      );
+
+      return rpcToolSuccess(id, [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              ok: true,
+              projectId,
+              mimeType,
+              bytes: bytes.byteLength,
+              ...uploaded
+            },
+            null,
+            2
+          )
         }
       ]);
     }
@@ -421,6 +626,213 @@ function findObjectWithScreenshot(value, depth = 0) {
   return null;
 }
 
+async function fetchRemoteUploadImage(rawUrl, env) {
+  const url = validatePublicHttpsUrl(rawUrl);
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      accept: "image/png,image/jpeg,image/webp,image/*;q=0.8,*/*;q=0.2",
+      "user-agent": "stitch-mcp-proxy/2.0"
+    },
+    redirect: "follow"
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Failed to download upload source image: HTTP ${response.status} ${response.statusText}`
+    );
+  }
+
+  const contentTypeHeader = response.headers.get("content-type") || "";
+  const declaredMime = normalizeUploadMime(
+    contentTypeHeader.split(";")[0].trim().toLowerCase()
+  );
+  const buffer = await response.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  enforceMaxImageBytes(bytes.byteLength, env);
+
+  const detectedMime = detectUploadMime(bytes);
+  if (!detectedMime) {
+    throw new Error("Downloaded file is not a supported PNG, JPEG, or WEBP image.");
+  }
+  if (declaredMime !== detectedMime) {
+    throw new Error(
+      `Image MIME mismatch: server declared ${declaredMime}, bytes are ${detectedMime}.`
+    );
+  }
+
+  return {
+    requestedUrl: url.toString(),
+    finalUrl: response.url || url.toString(),
+    mimeType: detectedMime,
+    bytes
+  };
+}
+
+function validatePublicHttpsUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") {
+    throw new Error("url is required");
+  }
+
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new Error("Invalid image URL");
+  }
+
+  if (url.protocol !== "https:") {
+    throw new Error("Only HTTPS image URLs are allowed");
+  }
+
+  const host = url.hostname.toLowerCase();
+  if (
+    host === "localhost" ||
+    host === "::1" ||
+    host.endsWith(".local") ||
+    host === "metadata.google.internal" ||
+    host === "169.254.169.254" ||
+    /^127\./.test(host) ||
+    /^10\./.test(host) ||
+    /^192\.168\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+  ) {
+    throw new Error(`Private or local image host is not allowed: ${host}`);
+  }
+
+  return url;
+}
+
+function normalizeUploadMime(mimeType) {
+  switch ((mimeType || "").toLowerCase()) {
+    case "image/png":
+      return "image/png";
+    case "image/jpeg":
+    case "image/jpg":
+      return "image/jpeg";
+    case "image/webp":
+      return "image/webp";
+    default:
+      throw new Error(
+        `Unsupported image MIME type: ${mimeType || "unknown"}. Supported: image/png, image/jpeg, image/webp.`
+      );
+  }
+}
+
+function detectUploadMime(bytes) {
+  if (isPng(bytes)) return "image/png";
+  if (isJpeg(bytes)) return "image/jpeg";
+  if (isWebp(bytes)) return "image/webp";
+  return null;
+}
+
+function decodeAndValidateUploadBase64(value, mimeType, env) {
+  if (!value || typeof value !== "string") {
+    throw new Error("fileContentBase64 is required");
+  }
+  if (value.startsWith("data:")) {
+    throw new Error(
+      "fileContentBase64 must contain only base64 bytes, without a data: URL prefix."
+    );
+  }
+
+  let bytes;
+  try {
+    bytes = base64ToBytes(value);
+  } catch {
+    throw new Error("fileContentBase64 is not valid base64");
+  }
+
+  enforceMaxImageBytes(bytes.byteLength, env);
+  const detectedMime = detectUploadMime(bytes);
+  if (!detectedMime) {
+    throw new Error("Uploaded bytes are not a supported PNG, JPEG, or WEBP image.");
+  }
+  if (detectedMime !== mimeType) {
+    throw new Error(
+      `Image MIME mismatch: argument says ${mimeType}, bytes are ${detectedMime}.`
+    );
+  }
+  return bytes;
+}
+
+function enforceMaxImageBytes(byteLength, env) {
+  const maxBytes = Number(env.MAX_IMAGE_BYTES || DEFAULT_MAX_IMAGE_BYTES);
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) {
+    throw new Error("MAX_IMAGE_BYTES must be a positive number.");
+  }
+  if (byteLength > maxBytes) {
+    throw new Error(
+      `Image is too large (${byteLength} bytes). Limit is ${maxBytes} bytes.`
+    );
+  }
+}
+
+async function uploadImageToStitch(
+  env,
+  apiKey,
+  projectId,
+  fileContentBase64,
+  mimeType,
+  options = {}
+) {
+  const screen = {
+    screenType: "IMAGE",
+    isCreatedByClient: true,
+    screenshot: {
+      fileContentBase64,
+      mimeType
+    }
+  };
+
+  if (options.title) screen.title = String(options.title);
+
+  const body = {
+    parent: `projects/${projectId}`,
+    requests: [{ screen }],
+    createScreenInstances: options.createScreenInstances !== false
+  };
+
+  const endpoint =
+    `${stitchApiBaseUrl(env)}/projects/${encodeURIComponent(projectId)}/screens:batchCreate`;
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      "x-goog-api-key": apiKey
+    },
+    body: JSON.stringify(body)
+  });
+
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(
+      `Stitch image upload failed: HTTP ${response.status}: ${truncate(raw, 800)}`
+    );
+  }
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `Stitch image upload returned non-JSON: ${truncate(raw, 800)}`
+    );
+  }
+
+  const screens = Array.isArray(data?.results)
+    ? data.results.map((result) => result?.screen).filter(Boolean)
+    : [];
+
+  return {
+    screenCount: screens.length,
+    screens,
+    rawResponse: screens.length ? undefined : data
+  };
+}
+
 async function fetchImageAsset(rawUrl, width, env) {
   const assetUrl = buildStitchAssetUrl(rawUrl, width);
   const response = await fetch(assetUrl, {
@@ -448,17 +860,7 @@ async function fetchImageAsset(rawUrl, width, env) {
   }
 
   const buffer = await response.arrayBuffer();
-  const maxBytes = Number(env.MAX_IMAGE_BYTES || DEFAULT_MAX_IMAGE_BYTES);
-
-  if (!Number.isFinite(maxBytes) || maxBytes <= 0) {
-    throw new Error("MAX_IMAGE_BYTES must be a positive number.");
-  }
-
-  if (buffer.byteLength > maxBytes) {
-    throw new Error(
-      `Image is too large (${buffer.byteLength} bytes). Limit is ${maxBytes} bytes.`
-    );
-  }
+  enforceMaxImageBytes(buffer.byteLength, env);
 
   return {
     requestedUrl: assetUrl,
@@ -730,7 +1132,13 @@ function requireBareId(value, field) {
 }
 
 async function proxyRawToStitch(request, env, apiKey, rawBody) {
-  return fetchStitch(request, env, apiKey, rawBody);
+  const upstream = await fetchStitch(request, env, apiKey, rawBody);
+  const headers = copyResponseHeaders(upstream.headers);
+  return new Response(upstream.body, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers
+  });
 }
 
 async function fetchStitch(request, env, apiKey, rawBody) {
@@ -769,6 +1177,10 @@ function stitchMcpUrl(env) {
   return env.STITCH_MCP_URL || DEFAULT_STITCH_MCP_URL;
 }
 
+function stitchApiBaseUrl(env) {
+  return (env.STITCH_API_URL || DEFAULT_STITCH_API_URL).replace(/\/$/, "");
+}
+
 function getStitchApiKey(request, env) {
   return env.STITCH_API_KEY || request.headers.get("x-goog-api-key") || "";
 }
@@ -797,9 +1209,17 @@ function timingSafeStringEqual(a, b) {
   return diff === 0;
 }
 
-async function parseJsonRpcResponse(response) {
-  const raw = await response.text();
+async function parseJsonRpcResponse(
+  response,
+  timeoutMs = DEFAULT_UPSTREAM_RPC_TIMEOUT_MS
+) {
   const contentType = response.headers.get("content-type") || "";
+
+  if (contentType.includes("text/event-stream")) {
+    return parseSseJsonRpcResponse(response, timeoutMs);
+  }
+
+  const raw = await readResponseTextWithTimeout(response, timeoutMs);
 
   if (contentType.includes("application/json") || raw.trim().startsWith("{")) {
     try {
@@ -809,27 +1229,156 @@ async function parseJsonRpcResponse(response) {
     }
   }
 
-  // Streamable HTTP may use SSE. Extract the first JSON-RPC data event.
-  if (contentType.includes("text/event-stream") || raw.includes("data:")) {
-    const events = raw.split(/\r?\n\r?\n/);
-    for (const event of events) {
-      const dataLines = event
-        .split(/\r?\n/)
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trim());
-
-      if (!dataLines.length) continue;
-      const data = dataLines.join("\n");
-      try {
-        const parsed = JSON.parse(data);
-        if (parsed?.jsonrpc === "2.0") return { rpc: parsed, raw };
-      } catch {
-        // Continue scanning other events.
-      }
-    }
+  if (raw.includes("data:")) {
+    return { rpc: extractJsonRpcFromSseText(raw), raw };
   }
 
   return { rpc: null, raw };
+}
+
+async function parseSseJsonRpcResponse(response, timeoutMs) {
+  if (!response.body) return { rpc: null, raw: "" };
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = "";
+  const deadline = Date.now() + timeoutMs;
+
+  try {
+    while (true) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(
+          `Timed out waiting for Stitch SSE JSON-RPC response after ${timeoutMs}ms`
+        );
+      }
+
+      const { value, done } = await withTimeout(
+        reader.read(),
+        remaining,
+        "Timed out waiting for Stitch SSE chunk"
+      );
+
+      if (done) break;
+      raw += decoder.decode(value, { stream: true });
+
+      const rpc = extractJsonRpcFromSseText(raw);
+      if (rpc) {
+        try {
+          await reader.cancel();
+        } catch {
+          // Ignore cancellation failures after receiving the JSON-RPC event.
+        }
+        return { rpc, raw };
+      }
+
+      if (raw.length > 2 * 1024 * 1024) {
+        throw new Error("Stitch SSE response exceeded 2 MiB without a JSON-RPC event");
+      }
+    }
+
+    raw += decoder.decode();
+    return { rpc: extractJsonRpcFromSseText(raw), raw };
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // Ignore.
+    }
+  }
+}
+
+function extractJsonRpcFromSseText(raw) {
+  const events = String(raw || "").split(/\r?\n\r?\n/);
+
+  for (const event of events) {
+    const dataLines = event
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trim());
+
+    if (!dataLines.length) continue;
+    const data = dataLines.join("\n");
+
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed?.jsonrpc === "2.0") return parsed;
+    } catch {
+      // Event may be incomplete; keep reading.
+    }
+  }
+
+  return null;
+}
+
+async function readResponseTextWithTimeout(response, timeoutMs) {
+  if (!response.body) return "";
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = "";
+  const deadline = Date.now() + timeoutMs;
+
+  try {
+    while (true) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(
+          `Timed out waiting for Stitch response body after ${timeoutMs}ms`
+        );
+      }
+
+      const { value, done } = await withTimeout(
+        reader.read(),
+        remaining,
+        "Timed out waiting for Stitch response chunk"
+      );
+      if (done) break;
+      raw += decoder.decode(value, { stream: true });
+
+      if (raw.length > 4 * 1024 * 1024) {
+        throw new Error("Stitch JSON-RPC response exceeded 4 MiB");
+      }
+    }
+    raw += decoder.decode();
+    return raw;
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // Ignore.
+    }
+  }
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    })
+  ]).finally(() => clearTimeout(timer));
+}
+
+function safeParseJson(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function jsonRpcResponse(rpc, status = 200) {
+  return new Response(JSON.stringify(rpc), {
+    status,
+    headers: {
+      ...corsHeaders(),
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "x-stitch-proxy-version": PROXY_VERSION
+    }
+  });
 }
 
 function rpcToolSuccess(id, content) {
@@ -866,10 +1415,24 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
+function base64ToBytes(value) {
+  const normalized = String(value).replace(/\s+/g, "");
+  const binary = atob(normalized);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
 function copyResponseHeaders(source) {
   const headers = new Headers(source);
   headers.set("access-control-allow-origin", "*");
-  headers.set("access-control-expose-headers", "mcp-session-id");
+  headers.set(
+    "access-control-expose-headers",
+    "mcp-session-id, x-stitch-proxy-version"
+  );
+  headers.set("x-stitch-proxy-version", PROXY_VERSION);
   return headers;
 }
 
@@ -879,7 +1442,9 @@ function corsHeaders() {
     "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
     "access-control-allow-headers":
       "Content-Type, Accept, Authorization, X-Bridge-Key, X-Goog-Api-Key, MCP-Session-Id, Last-Event-ID",
-    "access-control-expose-headers": "MCP-Session-Id"
+    "access-control-expose-headers":
+      "MCP-Session-Id, X-Stitch-Proxy-Version",
+    "x-stitch-proxy-version": PROXY_VERSION
   };
 }
 
