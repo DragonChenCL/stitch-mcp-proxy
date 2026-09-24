@@ -4,9 +4,12 @@ compatibility_date = "2026-09-24"
 keep_vars = true
 
 # Secrets (set in Cloudflare, DO NOT commit values):
-#   STITCH_API_KEY = Google Stitch API key
-#   BRIDGE_KEY     = your own password for this proxy
+#   STITCH_API_KEY      = Google Stitch API key
+#   STITCH_ACCESS_TOKEN = optional short-lived Google OAuth access token
+#   BRIDGE_KEY          = your own password for this proxy
 #
-# Optional variable:
+# Optional variables:
 # [vars]
 # STITCH_MCP_URL = "https://stitch.googleapis.com/mcp"
+# STITCH_API_URL = "https://stitch.googleapis.com"
+# STITCH_PROJECT_ID = "your-google-cloud-project-id" # OAuth quota project
