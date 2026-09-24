@@ -20,7 +20,7 @@
  *   X-Goog-Api-Key header will still be accepted and forwarded.
  */
 
-const PROXY_VERSION = "2026-09-24-image-bridge-v2";
+const PROXY_VERSION = "2026-09-24-image-bridge-v2.1";
 const DEFAULT_STITCH_MCP_URL = "https://stitch.googleapis.com/mcp";
 const DEFAULT_STITCH_API_URL = "https://stitch.googleapis.com";
 const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
