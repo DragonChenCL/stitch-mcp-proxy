@@ -953,7 +953,7 @@ async function uploadImageToStitch(
   };
 
   const endpoint =
-    `${stitchApiBaseUrl(env)}/projects/${encodeURIComponent(projectId)}/screens:batchCreate`;
+    `${stitchApiBaseUrl(env)}/v1/projects/${encodeURIComponent(projectId)}/screens:batchCreate`;
 
   const response = await fetch(endpoint, {
     method: "POST",
