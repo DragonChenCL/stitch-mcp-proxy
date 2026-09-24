@@ -11,16 +11,22 @@
  * Health:       /health
  *
  * Secrets:
- *   STITCH_API_KEY  recommended: keep the Google key only in Cloudflare
- *   BRIDGE_KEY      recommended: protects your public Worker endpoint
- *   PROXY_TOKEN     backward-compatible alias for BRIDGE_KEY
+ *   STITCH_API_KEY      Google Stitch API key
+ *   STITCH_ACCESS_TOKEN optional OAuth access token (short-lived; passthrough is preferred)
+ *   BRIDGE_KEY          recommended: protects your public Worker endpoint
+ *   PROXY_TOKEN         backward-compatible alias for BRIDGE_KEY
+ *
+ * OAuth passthrough:
+ *   Use bridge auth separately (prefer /mcp/<token>) and let
+ *   Authorization: Bearer <Google OAuth token> pass through to Stitch.
+ *   STITCH_PROJECT_ID / GOOGLE_CLOUD_PROJECT becomes X-Goog-User-Project.
  *
  * Backward compatibility:
  *   If STITCH_API_KEY is not configured as a secret, an incoming
  *   X-Goog-Api-Key header will still be accepted and forwarded.
  */
 
-const PROXY_VERSION = "2026-09-24-image-bridge-v2.1";
+const PROXY_VERSION = "2026-09-24-image-bridge-v2.2-oauth";
 const DEFAULT_STITCH_MCP_URL = "https://stitch.googleapis.com/mcp";
 const DEFAULT_STITCH_API_URL = "https://stitch.googleapis.com";
 const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -195,6 +201,12 @@ export default {
         upstream: stitchMcpUrl(env),
         apiBase: stitchApiBaseUrl(env),
         stitchApiKeyConfigured: Boolean(env.STITCH_API_KEY),
+        stitchAccessTokenConfigured: Boolean(
+          env.STITCH_ACCESS_TOKEN || env.STITCH_OAUTH_ACCESS_TOKEN
+        ),
+        stitchQuotaProjectConfigured: Boolean(
+          env.STITCH_PROJECT_ID || env.GOOGLE_CLOUD_PROJECT
+        ),
         bridgeKeyConfigured: Boolean(env.BRIDGE_KEY),
         proxyTokenConfigured: Boolean(env.PROXY_TOKEN),
         authConfigured: Boolean(env.BRIDGE_KEY || env.PROXY_TOKEN),
@@ -214,19 +226,19 @@ export default {
         return jsonResponse({ error: "Unauthorized" }, 401);
       }
 
-      const apiKey = getStitchApiKey(request, env);
-      if (!apiKey) {
+      const stitchAuth = resolveStitchAuth(request, env);
+      if (stitchAuth.type === "none") {
         return jsonResponse(
           {
-            error: "Missing Stitch API key",
+            error: "Missing Stitch authentication",
             hint:
-              "Set Cloudflare secret STITCH_API_KEY, or send X-Goog-Api-Key in the request."
+              "Use Google OAuth Bearer auth (scope https://www.googleapis.com/auth/aida) or set STITCH_API_KEY."
           },
-          500
+          401
         );
       }
 
-      return handleSelfTest(env, apiKey);
+      return handleSelfTest(request, env, stitchAuth);
     }
 
     if (!isMcpPath(url.pathname)) {
@@ -253,16 +265,12 @@ export default {
       return jsonResponse({ error: "Unauthorized" }, 401);
     }
 
-    const apiKey = getStitchApiKey(request, env);
-    if (!apiKey) {
-      return jsonResponse(
-        {
-          error: "Missing Stitch API key",
-          hint:
-            "Set Cloudflare secret STITCH_API_KEY, or send X-Goog-Api-Key in the request."
-        },
-        500
-      );
+    const stitchAuth = resolveStitchAuth(request, env);
+
+    // Without Google credentials, forward directly so Google's MCP endpoint
+    // can return the real OAuth challenge instead of this proxy masking it.
+    if (stitchAuth.type === "none") {
+      return proxyRawToStitch(request, env, stitchAuth);
     }
 
     // A normal browser navigation uses GET + Accept: text/html. Do not forward
@@ -285,7 +293,7 @@ export default {
     // Only POST JSON-RPC requests need inspection; non-browser GET/DELETE
     // requests are proxied to the upstream MCP server.
     if (request.method !== "POST") {
-      return proxyRawToStitch(request, env, apiKey);
+      return proxyRawToStitch(request, env, stitchAuth);
     }
 
     const rawBody = await request.text();
@@ -294,34 +302,34 @@ export default {
     try {
       rpc = JSON.parse(rawBody);
     } catch {
-      return proxyRawToStitch(request, env, apiKey, rawBody);
+      return proxyRawToStitch(request, env, stitchAuth, rawBody);
     }
 
     // Batch/unknown payloads are forwarded untouched.
     if (!rpc || Array.isArray(rpc) || rpc.jsonrpc !== "2.0") {
-      return proxyRawToStitch(request, env, apiKey, rawBody);
+      return proxyRawToStitch(request, env, stitchAuth, rawBody);
     }
 
     if (rpc.method === "initialize") {
-      return handleInitialize(request, env, apiKey, rawBody);
+      return handleInitialize(request, env, stitchAuth, rawBody);
     }
 
     if (rpc.method === "tools/list") {
-      return handleToolsList(request, env, apiKey, rawBody);
+      return handleToolsList(request, env, stitchAuth, rawBody);
     }
 
     if (rpc.method === "tools/call") {
       const toolName = rpc?.params?.name;
       if (LOCAL_TOOLS.some((tool) => tool.name === toolName)) {
-        return handleLocalTool(request, env, apiKey, rpc);
+        return handleLocalTool(request, env, stitchAuth, rpc);
       }
     }
 
-    return proxyRawToStitch(request, env, apiKey, rawBody);
+    return proxyRawToStitch(request, env, stitchAuth, rawBody);
   }
 };
 
-async function handleSelfTest(env, apiKey) {
+async function handleSelfTest(request, env, stitchAuth) {
   const protocolVersion = "2025-06-18";
   const initializePayload = {
     jsonrpc: "2.0",
@@ -339,11 +347,10 @@ async function handleSelfTest(env, apiKey) {
 
   const initResponse = await fetch(stitchMcpUrl(env), {
     method: "POST",
-    headers: {
+    headers: buildGoogleRequestHeaders(stitchAuth, {
       "content-type": "application/json",
-      accept: "application/json, text/event-stream",
-      "x-goog-api-key": apiKey
-    },
+      accept: "application/json, text/event-stream"
+    }),
     body: JSON.stringify(initializePayload)
   });
   const sessionId = initResponse.headers.get("mcp-session-id");
@@ -370,13 +377,12 @@ async function handleSelfTest(env, apiKey) {
     method: "tools/list",
     params: {}
   };
-  const headers = {
+  const headers = buildGoogleRequestHeaders(stitchAuth, {
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
-    "x-goog-api-key": apiKey,
     "mcp-protocol-version":
       initialized.rpc?.result?.protocolVersion || protocolVersion
-  };
+  });
   if (sessionId) headers["mcp-session-id"] = sessionId;
 
   const toolsResponse = await fetch(stitchMcpUrl(env), {
@@ -432,8 +438,8 @@ async function handleSelfTest(env, apiKey) {
   });
 }
 
-async function handleInitialize(request, env, apiKey, rawBody) {
-  const upstream = await fetchStitch(request, env, apiKey, rawBody);
+async function handleInitialize(request, env, stitchAuth, rawBody) {
+  const upstream = await fetchStitch(request, env, stitchAuth, rawBody);
   const parsed = await parseJsonRpcResponse(upstream);
 
   if (!parsed.rpc) {
@@ -470,11 +476,11 @@ async function handleInitialize(request, env, apiKey, rawBody) {
   return jsonRpcResponse(parsed.rpc, upstream.status);
 }
 
-async function handleToolsList(request, env, apiKey, rawBody) {
+async function handleToolsList(request, env, stitchAuth, rawBody) {
   const requestRpc = safeParseJson(rawBody);
 
   try {
-    const upstream = await fetchStitch(request, env, apiKey, rawBody);
+    const upstream = await fetchStitch(request, env, stitchAuth, rawBody);
     const parsed = await parseJsonRpcResponse(upstream);
 
     if (!parsed.rpc) {
@@ -524,7 +530,7 @@ function localToolsFallbackResponse(id, reason) {
   });
 }
 
-async function handleLocalTool(request, env, apiKey, rpc) {
+async function handleLocalTool(request, env, stitchAuth, rpc) {
   const id = rpc.id ?? null;
   const name = rpc?.params?.name;
   const args = rpc?.params?.arguments || {};
@@ -549,8 +555,9 @@ async function handleLocalTool(request, env, apiKey, rpc) {
       const projectId = requireBareId(args.projectId, "projectId");
       const asset = await fetchRemoteUploadImage(args.url, env);
       const uploaded = await uploadImageToStitch(
+        request,
         env,
-        apiKey,
+        stitchAuth,
         projectId,
         bytesToBase64(asset.bytes),
         asset.mimeType,
@@ -588,8 +595,9 @@ async function handleLocalTool(request, env, apiKey, rpc) {
         env
       );
       const uploaded = await uploadImageToStitch(
+        request,
         env,
-        apiKey,
+        stitchAuth,
         projectId,
         bytesToBase64(bytes),
         mimeType,
@@ -628,7 +636,7 @@ async function handleLocalTool(request, env, apiKey, rpc) {
       const screenCall = await callUpstreamTool(
         request,
         env,
-        apiKey,
+        stitchAuth,
         "get_screen",
         { name: screenName }
       );
@@ -686,7 +694,7 @@ async function handleLocalTool(request, env, apiKey, rpc) {
   }
 }
 
-async function callUpstreamTool(request, env, apiKey, name, args) {
+async function callUpstreamTool(request, env, stitchAuth, name, args) {
   const payload = {
     jsonrpc: "2.0",
     id: `bridge-${crypto.randomUUID()}`,
@@ -928,8 +936,9 @@ function enforceMaxImageBytes(byteLength, env) {
 }
 
 async function uploadImageToStitch(
+  request,
   env,
-  apiKey,
+  stitchAuth,
   projectId,
   fileContentBase64,
   mimeType,
@@ -957,11 +966,10 @@ async function uploadImageToStitch(
 
   const response = await fetch(endpoint, {
     method: "POST",
-    headers: {
+    headers: buildGoogleRequestHeaders(stitchAuth, {
       "content-type": "application/json",
-      accept: "application/json",
-      "x-goog-api-key": apiKey
-    },
+      accept: "application/json"
+    }),
     body: JSON.stringify(body)
   });
 
@@ -1290,8 +1298,8 @@ function requireBareId(value, field) {
   return trimmed;
 }
 
-async function proxyRawToStitch(request, env, apiKey, rawBody) {
-  const upstream = await fetchStitch(request, env, apiKey, rawBody);
+async function proxyRawToStitch(request, env, stitchAuth, rawBody) {
+  const upstream = await fetchStitch(request, env, stitchAuth, rawBody);
   const headers = copyResponseHeaders(upstream.headers);
   return new Response(upstream.body, {
     status: upstream.status,
@@ -1300,8 +1308,8 @@ async function proxyRawToStitch(request, env, apiKey, rawBody) {
   });
 }
 
-async function fetchStitch(request, env, apiKey, rawBody) {
-  const headers = buildUpstreamHeaders(request.headers, apiKey);
+async function fetchStitch(request, env, stitchAuth, rawBody) {
+  const headers = buildUpstreamHeaders(request.headers, stitchAuth, env);
   const init = {
     method: request.method,
     headers,
@@ -1315,21 +1323,111 @@ async function fetchStitch(request, env, apiKey, rawBody) {
   return fetch(stitchMcpUrl(env), init);
 }
 
-function buildUpstreamHeaders(incoming, apiKey) {
+function buildUpstreamHeaders(incoming, stitchAuth, env) {
   const headers = new Headers(incoming);
 
   headers.delete("host");
   headers.delete("content-length");
   headers.delete("x-bridge-key");
+  headers.delete("x-proxy-token");
+  headers.delete("x-stitch-authorization");
+  headers.delete("x-stitch-access-token");
+  headers.delete("x-goog-api-key");
+  headers.delete("x-goog-user-project");
 
-  // Never forward our own Bearer bridge password as Google auth.
-  const auth = headers.get("authorization");
-  if (auth && auth.toLowerCase().startsWith("bearer ")) {
+  const incomingAuthorization = headers.get("authorization") || "";
+  if (isBridgeAuthorization(incomingAuthorization, env)) {
     headers.delete("authorization");
   }
 
-  headers.set("x-goog-api-key", apiKey);
+  applyGoogleAuthHeaders(headers, stitchAuth);
   return headers;
+}
+
+function buildGoogleRequestHeaders(stitchAuth, extra = {}) {
+  const headers = new Headers(extra);
+  applyGoogleAuthHeaders(headers, stitchAuth);
+  return headers;
+}
+
+function applyGoogleAuthHeaders(headers, stitchAuth) {
+  if (!stitchAuth || stitchAuth.type === "none") return headers;
+
+  if (stitchAuth.type === "oauth") {
+    headers.set("authorization", stitchAuth.authorization);
+    if (stitchAuth.quotaProjectId) {
+      headers.set("x-goog-user-project", stitchAuth.quotaProjectId);
+    }
+    headers.delete("x-goog-api-key");
+    return headers;
+  }
+
+  headers.set("x-goog-api-key", stitchAuth.apiKey);
+  headers.delete("authorization");
+  headers.delete("x-goog-user-project");
+  return headers;
+}
+
+function normalizeBearerAuthorization(value) {
+  if (!value || typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!/^Bearer\s+\S+/i.test(trimmed)) return "";
+  return trimmed;
+}
+
+function isBridgeAuthorization(authorization, env) {
+  const normalized = normalizeBearerAuthorization(authorization);
+  if (!normalized) return false;
+  const token = normalized.replace(/^Bearer\s+/i, "");
+  return configuredBridgeSecrets(env).some((secret) =>
+    timingSafeStringEqual(token, secret)
+  );
+}
+
+function resolveStitchAuth(request, env) {
+  const explicitAuthorization = normalizeBearerAuthorization(
+    request.headers.get("x-stitch-authorization") || ""
+  );
+  const explicitToken = (request.headers.get("x-stitch-access-token") || "").trim();
+  const incomingAuthorization = normalizeBearerAuthorization(
+    request.headers.get("authorization") || ""
+  );
+  const envAccessToken = String(
+    env.STITCH_ACCESS_TOKEN || env.STITCH_OAUTH_ACCESS_TOKEN || ""
+  ).trim();
+
+  let authorization = explicitAuthorization;
+  if (!authorization && explicitToken) {
+    authorization = `Bearer ${explicitToken.replace(/^Bearer\s+/i, "")}`;
+  }
+  if (
+    !authorization &&
+    incomingAuthorization &&
+    !isBridgeAuthorization(incomingAuthorization, env)
+  ) {
+    authorization = incomingAuthorization;
+  }
+  if (!authorization && envAccessToken) {
+    authorization = `Bearer ${envAccessToken.replace(/^Bearer\s+/i, "")}`;
+  }
+
+  const quotaProjectId =
+    (request.headers.get("x-goog-user-project") || "").trim() ||
+    String(env.STITCH_PROJECT_ID || env.GOOGLE_CLOUD_PROJECT || "").trim();
+
+  if (authorization) {
+    return { type: "oauth", authorization, quotaProjectId };
+  }
+
+  const apiKey =
+    String(env.STITCH_API_KEY || "").trim() ||
+    (request.headers.get("x-goog-api-key") || "").trim();
+
+  if (apiKey) {
+    return { type: "apiKey", apiKey, quotaProjectId: "" };
+  }
+
+  return { type: "none", quotaProjectId };
 }
 
 function stitchMcpUrl(env) {
@@ -1338,10 +1436,6 @@ function stitchMcpUrl(env) {
 
 function stitchApiBaseUrl(env) {
   return (env.STITCH_API_URL || DEFAULT_STITCH_API_URL).replace(/\/$/, "");
-}
-
-function getStitchApiKey(request, env) {
-  return env.STITCH_API_KEY || request.headers.get("x-goog-api-key") || "";
 }
 
 function isBrowserNavigation(request) {
