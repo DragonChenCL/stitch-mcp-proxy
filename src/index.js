@@ -13,6 +13,7 @@
  * Secrets:
  *   STITCH_API_KEY  recommended: keep the Google key only in Cloudflare
  *   BRIDGE_KEY      recommended: protects your public Worker endpoint
+ *   PROXY_TOKEN     backward-compatible alias for BRIDGE_KEY
  *
  * Backward compatibility:
  *   If STITCH_API_KEY is not configured as a secret, an incoming
@@ -195,13 +196,21 @@ export default {
         apiBase: stitchApiBaseUrl(env),
         stitchApiKeyConfigured: Boolean(env.STITCH_API_KEY),
         bridgeKeyConfigured: Boolean(env.BRIDGE_KEY),
+        proxyTokenConfigured: Boolean(env.PROXY_TOKEN),
+        authConfigured: Boolean(env.BRIDGE_KEY || env.PROXY_TOKEN),
+        authModes: [
+          "path:/mcp/<token>",
+          "query:?token=<token>",
+          "header:X-Bridge-Key",
+          "header:Authorization Bearer"
+        ],
         localTools: LOCAL_TOOLS.map((x) => x.name),
         time: new Date().toISOString()
       });
     }
 
     if (url.pathname === "/selftest") {
-      if (!isAuthorized(request, env)) {
+      if (!isAuthorized(request, env, url)) {
         return jsonResponse({ error: "Unauthorized" }, 401);
       }
 
@@ -220,12 +229,13 @@ export default {
       return handleSelfTest(env, apiKey);
     }
 
-    if (url.pathname !== "/mcp") {
+    if (!isMcpPath(url.pathname)) {
       return new Response(
         [
           "stitch-mcp-proxy",
           "",
           "MCP endpoint: POST/GET/DELETE /mcp",
+          "MCP token:    POST/GET/DELETE /mcp/<token>",
           "Health:       GET /health",
           "Self-test:    GET /selftest"
         ].join("\n"),
@@ -239,7 +249,7 @@ export default {
       );
     }
 
-    if (!isAuthorized(request, env)) {
+    if (!isAuthorized(request, env, url)) {
       return jsonResponse({ error: "Unauthorized" }, 401);
     }
 
@@ -1317,15 +1327,55 @@ function getStitchApiKey(request, env) {
   return env.STITCH_API_KEY || request.headers.get("x-goog-api-key") || "";
 }
 
-function isAuthorized(request, env) {
-  if (!env.BRIDGE_KEY) return true;
+function isMcpPath(pathname) {
+  return pathname === "/mcp" || /^\/mcp\/[^/]+\/?$/.test(pathname);
+}
+
+function configuredBridgeSecrets(env) {
+  return [env.BRIDGE_KEY, env.PROXY_TOKEN]
+    .filter((value) => typeof value === "string" && value.length > 0);
+}
+
+function pathTokenFromUrl(url) {
+  const match = url.pathname.match(/^\/mcp\/([^/]+)\/?$/);
+  if (!match) return "";
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return match[1];
+  }
+}
+
+function isAuthorized(request, env, requestUrl) {
+  const secrets = configuredBridgeSecrets(env);
+  if (!secrets.length) return true;
+
+  const url = requestUrl instanceof URL ? requestUrl : new URL(request.url);
+  const candidates = [];
+
+  const pathToken = pathTokenFromUrl(url);
+  if (pathToken) candidates.push(pathToken);
+
+  const queryToken = url.searchParams.get("token");
+  if (queryToken) candidates.push(queryToken);
 
   const direct = request.headers.get("x-bridge-key");
-  if (direct && timingSafeStringEqual(direct, env.BRIDGE_KEY)) return true;
+  if (direct) candidates.push(direct);
+
+  const proxyToken = request.headers.get("x-proxy-token");
+  if (proxyToken) candidates.push(proxyToken);
 
   const auth = request.headers.get("authorization") || "";
   const match = auth.match(/^Bearer\s+(.+)$/i);
-  return Boolean(match && timingSafeStringEqual(match[1], env.BRIDGE_KEY));
+  if (match?.[1]) candidates.push(match[1]);
+
+  for (const candidate of candidates) {
+    for (const secret of secrets) {
+      if (timingSafeStringEqual(candidate, secret)) return true;
+    }
+  }
+
+  return false;
 }
 
 // Constant-ish time comparison for short shared secrets without Node dependencies.
@@ -1573,7 +1623,7 @@ function corsHeaders() {
     "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
     "access-control-allow-headers":
-      "Content-Type, Accept, Authorization, X-Bridge-Key, X-Goog-Api-Key, MCP-Session-Id, Last-Event-ID",
+      "Content-Type, Accept, Authorization, X-Bridge-Key, X-Proxy-Token, X-Goog-Api-Key, MCP-Session-Id, Last-Event-ID",
     "access-control-expose-headers":
       "MCP-Session-Id, X-Stitch-Proxy-Version",
     "x-stitch-proxy-version": PROXY_VERSION
