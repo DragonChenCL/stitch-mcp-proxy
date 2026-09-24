@@ -383,7 +383,7 @@ async function handleSelfTest(request, env, stitchAuth) {
     "mcp-protocol-version":
       initialized.rpc?.result?.protocolVersion || protocolVersion
   });
-  if (sessionId) headers["mcp-session-id"] = sessionId;
+  if (sessionId) headers.set("mcp-session-id", sessionId);
 
   const toolsResponse = await fetch(stitchMcpUrl(env), {
     method: "POST",
