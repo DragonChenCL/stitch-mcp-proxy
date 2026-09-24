@@ -229,3 +229,117 @@ Stitch -> Agent 获取原图 -> 处理 PNG/透明通道 -> upload_stitch_image -
 ```
 
 Worker 本身不负责抠图或生成透明通道，只负责把真实图片字节可靠地取回和上传。
+
+
+## 9. 图片上传策略与画布 placement
+
+### Alpha / PNG
+
+上传工具现在会先检查真实图片字节：
+
+- PNG 原生 alpha / PNG `tRNS`：保持 `image/png`
+- `backgroundRemoved: true`：必须使用 `image/png`
+- 透明 WEBP：**拒绝上传**，不会只改 MIME 冒充 PNG，也不会让 Stitch 有机会把它转成 JPEG
+
+Worker 当前没有内置可靠的无损 WEBP → PNG 解码/重编码能力，所以透明 WEBP 的安全行为是明确报错，调用方先转成 PNG 再上传。普通不透明 JPEG / WEBP 仍可上传。
+
+### 原始分辨率
+
+`upload_stitch_image` 和 `upload_stitch_image_from_url` 的正式上传路径始终发送原始图片字节，不做 preview resize。新增：
+
+```json
+{
+  "preserveOriginalSize": true
+}
+```
+
+默认即为 `true`。另外，`fetch_stitch_screen_image` / `inspect_stitch_screen_image` 不再在未传 `width` 时偷偷使用 Stitch screen width；只有显式传 `width` 才请求缩略图。
+
+如果显式 resize 一个 PNG，而 Google 图片 CDN 返回了非 PNG，Worker 会放弃该 resize，返回原始 PNG，避免透明通道因为 JPEG 转码丢失。
+
+### placement
+
+两个上传工具都支持可选：
+
+```json
+{
+  "placement": {
+    "mode": "near_screen",
+    "screenId": "bf475025c36a4626a5a48628f50c21e7",
+    "gap": 40,
+    "align": "top"
+  }
+}
+```
+
+支持模式：
+
+- `near_screen`：优先右侧，碰撞后尝试下方，再继续下一行
+- `absolute`：直接使用 `x / y`
+- `asset_area`：优先识别 IMAGE screen 对应的局部密集区域，在该局部区域附近紧凑排布，不使用全局 `maxX + N`
+- `auto`：显式 `screenId` → 最近更新的 IMAGE 素材 → `asset_area`
+
+旧调用不传 `placement` 时保持兼容：仍由 Stitch 默认创建实例，只增加实例存在性校验，不主动搬动已有默认位置。
+
+### screenInstance 的真实实现和限制
+
+Stitch 官方 MCP 当前可以通过 `get_project` 读取 `screenInstances`，但没有公开的 MCP 工具更新 x/y。Worker 的流程是：
+
+```text
+BatchCreateScreens(createScreenInstances=true)
+  -> get_project 验证 screenInstance
+  -> (placement 指定时) PATCH /v1/projects/{projectId}?updateMask=screenInstances
+  -> get_project 再次读取，校验实例和最终 x/y
+```
+
+如果 BatchCreateScreens 没有真正创建实例，Worker 会尝试通过同一个 project PATCH 补建实例；如果 PATCH 失败，返回结果会明确带：
+
+```json
+{
+  "instanceCreated": false,
+  "placementApplied": false,
+  "reason": "..."
+}
+```
+
+注意：这个 project PATCH 是 Stitch 当前未正式文档化的画布写入 workaround。OAuth 通常可用；API Key 在部分账号会返回 401/403。Worker 会把真实 HTTP 状态和原因返回，不会把“screen resource 创建成功”冒充成“画布实例创建/定位成功”。
+
+成功时返回包含源图真实信息与最终实例坐标：
+
+```json
+{
+  "ok": true,
+  "screen": {
+    "id": "...",
+    "title": "...",
+    "width": 1024,
+    "height": 1024,
+    "mimeType": "image/png",
+    "format": "png",
+    "hasAlpha": true,
+    "nativeAlphaChannel": true
+  },
+  "instanceCreated": true,
+  "placementApplied": true,
+  "instance": {
+    "id": "...",
+    "x": 2692,
+    "y": -1048,
+    "width": 512,
+    "height": 512
+  }
+}
+```
+
+### 图片检查字段
+
+以下四个工具统一返回/报告：
+
+- `mimeType`
+- `format`
+- `width`
+- `height`
+- `hasAlpha`
+- `nativeAlphaChannel`
+
+工具：`fetch_stitch_image`、`fetch_stitch_screen_image`、`inspect_stitch_image`、`inspect_stitch_screen_image`。

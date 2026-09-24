@@ -26,11 +26,49 @@
  *   X-Goog-Api-Key header will still be accepted and forwarded.
  */
 
-const PROXY_VERSION = "2026-09-24-image-bridge-v2.2-oauth";
+const PROXY_VERSION = "2026-09-24-image-bridge-v2.3-canvas-placement";
 const DEFAULT_STITCH_MCP_URL = "https://stitch.googleapis.com/mcp";
 const DEFAULT_STITCH_API_URL = "https://stitch.googleapis.com";
 const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_UPSTREAM_RPC_TIMEOUT_MS = 15_000;
+
+const PLACEMENT_SCHEMA = {
+  type: "object",
+  properties: {
+    mode: {
+      type: "string",
+      enum: ["near_screen", "absolute", "asset_area", "auto"],
+      description:
+        "Canvas placement strategy. Omit placement to preserve the legacy Stitch default layout."
+    },
+    screenId: {
+      type: "string",
+      description:
+        "Source screen ID used by near_screen. In auto mode it is preferred when supplied."
+    },
+    gap: {
+      type: "number",
+      minimum: 0,
+      maximum: 2000,
+      description: "Gap in canvas units. Defaults to 40."
+    },
+    align: {
+      type: "string",
+      enum: ["top", "center", "bottom"],
+      description: "Alignment relative to the target screen. Defaults to top."
+    },
+    x: {
+      type: "number",
+      description: "Absolute canvas X coordinate. Required for absolute mode."
+    },
+    y: {
+      type: "number",
+      description: "Absolute canvas Y coordinate. Required for absolute mode."
+    }
+  },
+  required: ["mode"],
+  additionalProperties: false
+};
 
 const LOCAL_TOOLS = [
   {
@@ -144,7 +182,18 @@ const LOCAL_TOOLS = [
           type: "boolean",
           description:
             "Whether to add the new screen to the project canvas. Defaults to true."
-        }
+        },
+        preserveOriginalSize: {
+          type: "boolean",
+          description:
+            "Keep the exact source image bytes and native pixel dimensions for the uploaded screen. Defaults to true."
+        },
+        backgroundRemoved: {
+          type: "boolean",
+          description:
+            "Set true when the image is a background-removed asset. Such uploads must be PNG so transparency cannot be lost."
+        },
+        placement: PLACEMENT_SCHEMA
       },
       required: ["projectId", "url"],
       additionalProperties: false
@@ -177,7 +226,18 @@ const LOCAL_TOOLS = [
           type: "boolean",
           description:
             "Whether to add the new screen to the project canvas. Defaults to true."
-        }
+        },
+        preserveOriginalSize: {
+          type: "boolean",
+          description:
+            "Keep the exact source image bytes and native pixel dimensions for the uploaded screen. Defaults to true."
+        },
+        backgroundRemoved: {
+          type: "boolean",
+          description:
+            "Set true when the image is a background-removed asset. Such uploads must be PNG so transparency cannot be lost."
+        },
+        placement: PLACEMENT_SCHEMA
       },
       required: ["projectId", "fileContentBase64", "mimeType"],
       additionalProperties: false
@@ -554,6 +614,8 @@ async function handleLocalTool(request, env, stitchAuth, rpc) {
     if (name === "upload_stitch_image_from_url") {
       const projectId = requireBareId(args.projectId, "projectId");
       const asset = await fetchRemoteUploadImage(args.url, env);
+      const sourceMetadata = detectImageMetadata(asset.bytes, asset.mimeType);
+      enforceUploadImagePolicy(asset.mimeType, sourceMetadata, args);
       const uploaded = await uploadImageToStitch(
         request,
         env,
@@ -563,7 +625,11 @@ async function handleLocalTool(request, env, stitchAuth, rpc) {
         asset.mimeType,
         {
           title: args.title,
-          createScreenInstances: args.createScreenInstances
+          createScreenInstances: args.createScreenInstances,
+          preserveOriginalSize: args.preserveOriginalSize,
+          backgroundRemoved: args.backgroundRemoved,
+          placement: args.placement,
+          sourceMetadata
         }
       );
 
@@ -594,6 +660,8 @@ async function handleLocalTool(request, env, stitchAuth, rpc) {
         mimeType,
         env
       );
+      const sourceMetadata = detectImageMetadata(bytes, mimeType);
+      enforceUploadImagePolicy(mimeType, sourceMetadata, args);
       const uploaded = await uploadImageToStitch(
         request,
         env,
@@ -603,7 +671,11 @@ async function handleLocalTool(request, env, stitchAuth, rpc) {
         mimeType,
         {
           title: args.title,
-          createScreenInstances: args.createScreenInstances
+          createScreenInstances: args.createScreenInstances,
+          preserveOriginalSize: args.preserveOriginalSize,
+          backgroundRemoved: args.backgroundRemoved,
+          placement: args.placement,
+          sourceMetadata
         }
       );
 
@@ -648,7 +720,7 @@ async function handleLocalTool(request, env, stitchAuth, rpc) {
         );
       }
 
-      const width = normalizeWidth(args.width ?? screenInfo.width);
+      const width = normalizeWidth(args.width);
       const asset = await fetchImageAsset(screenInfo.downloadUrl, width, env);
 
       if (name === "fetch_stitch_screen_image") {
@@ -708,7 +780,7 @@ async function callUpstreamTool(request, env, stitchAuth, name, args) {
   const upstream = await fetchStitch(
     request,
     env,
-    apiKey,
+    stitchAuth,
     JSON.stringify(payload)
   );
 
@@ -893,6 +965,18 @@ function detectUploadMime(bytes) {
   return null;
 }
 
+function enforceUploadImagePolicy(mimeType, metadata, options = {}) {
+  const requiresPng =
+    metadata?.hasAlpha === true || options.backgroundRemoved === true;
+
+  if (requiresPng && mimeType !== "image/png") {
+    throw new Error(
+      "Alpha/background-removed uploads must be image/png. " +
+        "Transparent WEBP is intentionally rejected because Stitch may transcode it to JPEG and destroy transparency."
+    );
+  }
+}
+
 function decodeAndValidateUploadBase64(value, mimeType, env) {
   if (!value || typeof value !== "string") {
     throw new Error("fileContentBase64 is required");
@@ -944,6 +1028,17 @@ async function uploadImageToStitch(
   mimeType,
   options = {}
 ) {
+  const sourceMetadata = options.sourceMetadata || {
+    format: mimeType.replace("image/", ""),
+    width: null,
+    height: null,
+    hasAlpha: null,
+    nativeAlphaChannel: null
+  };
+
+  // Upload the exact source bytes. Preview/download resizing is deliberately
+  // separated from this path so a 1024x1024 source can never become 256x256
+  // merely because a preview was requested elsewhere.
   const screen = {
     screenType: "IMAGE",
     isCreatedByClient: true,
@@ -955,10 +1050,11 @@ async function uploadImageToStitch(
 
   if (options.title) screen.title = String(options.title);
 
+  const createScreenInstances = options.createScreenInstances !== false;
   const body = {
     parent: `projects/${projectId}`,
     requests: [{ screen }],
-    createScreenInstances: options.createScreenInstances !== false
+    createScreenInstances
   };
 
   const endpoint =
@@ -992,21 +1088,728 @@ async function uploadImageToStitch(
   const screens = Array.isArray(data?.results)
     ? data.results.map((result) => result?.screen).filter(Boolean)
     : [];
+  const created = screens[0] || null;
+  const screenName = extractScreenResourceName(created, projectId);
+  const screenId = screenName?.split("/screens/")[1] || created?.id || null;
+  const screenSummary = {
+    id: screenId,
+    name: screenName,
+    title: created?.title ?? options.title ?? null,
+    width: sourceMetadata.width ?? null,
+    height: sourceMetadata.height ?? null,
+    mimeType,
+    format: sourceMetadata.format ?? null,
+    hasAlpha: sourceMetadata.hasAlpha ?? null,
+    nativeAlphaChannel: sourceMetadata.nativeAlphaChannel ?? null
+  };
+
+  let instanceResult;
+  if (!createScreenInstances) {
+    instanceResult = {
+      instanceCreated: false,
+      placementApplied: false,
+      reason: "createScreenInstances=false; no canvas instance was requested."
+    };
+  } else if (!screenName) {
+    instanceResult = {
+      instanceCreated: false,
+      placementApplied: false,
+      reason:
+        "Stitch created the screen resource but did not return a screen resource name, so the canvas instance could not be verified."
+    };
+  } else {
+    instanceResult = await ensureScreenInstancePlacement(
+      request,
+      env,
+      stitchAuth,
+      projectId,
+      screenName,
+      sourceMetadata,
+      options.placement
+    );
+  }
 
   return {
     screenCount: screens.length,
     screens,
+    screen: screenSummary,
+    preserveOriginalSize: true,
+    requestedPreserveOriginalSize: options.preserveOriginalSize !== false,
+    ...instanceResult,
     rawResponse: screens.length ? undefined : data
   };
 }
 
+function extractScreenResourceName(screen, projectId) {
+  if (typeof screen?.name === "string" && screen.name.includes("/screens/")) {
+    return screen.name;
+  }
+  if (typeof screen?.id === "string" && screen.id) {
+    return `projects/${projectId}/screens/${screen.id}`;
+  }
+  return null;
+}
+
+function summarizeScreenInstance(instance) {
+  if (!instance) return null;
+  return {
+    id: instance.id ?? null,
+    sourceScreen: instance.sourceScreen ?? null,
+    x: finiteNumberOrNull(instance.x),
+    y: finiteNumberOrNull(instance.y),
+    width: finiteNumberOrNull(instance.width),
+    height: finiteNumberOrNull(instance.height),
+    label: instance.label ?? null,
+    type: instance.type ?? null
+  };
+}
+
+function finiteNumberOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function ensureScreenInstancePlacement(
+  request,
+  env,
+  stitchAuth,
+  projectId,
+  screenName,
+  sourceMetadata,
+  rawPlacement
+) {
+  const placement = normalizePlacement(rawPlacement);
+  let snapshot = null;
+  let instance = null;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    snapshot = await getProjectSnapshot(request, env, stitchAuth, projectId);
+    instance = findInstanceForScreen(snapshot.screenInstances, screenName);
+    if (instance) break;
+    if (attempt < 2) await sleep(250 * (attempt + 1));
+  }
+
+  if (instance && !placement) {
+    return {
+      instanceCreated: true,
+      placementApplied: null,
+      instance: summarizeScreenInstance(instance)
+    };
+  }
+
+  const fallbackSize = canvasDisplaySize(
+    sourceMetadata.width,
+    sourceMetadata.height
+  );
+  const screenSize = {
+    width: finiteNumberOrNull(instance?.width) ?? fallbackSize.width,
+    height: finiteNumberOrNull(instance?.height) ?? fallbackSize.height
+  };
+
+  let desired;
+  try {
+    desired = await resolvePlacement(
+      request,
+      env,
+      stitchAuth,
+      projectId,
+      placement || { mode: "asset_area", gap: 40, align: "top", screenId: null },
+      snapshot?.screenInstances || [],
+      screenName,
+      screenSize
+    );
+  } catch (error) {
+    return {
+      instanceCreated: Boolean(instance),
+      placementApplied: false,
+      instance: summarizeScreenInstance(instance),
+      reason: `Could not resolve canvas placement: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+
+  const currentInstances = Array.isArray(snapshot?.screenInstances)
+    ? snapshot.screenInstances
+    : [];
+
+  let nextInstance;
+  let nextInstances;
+
+  if (instance) {
+    nextInstance = {
+      ...instance,
+      x: desired.x,
+      y: desired.y,
+      width: finiteNumberOrNull(instance.width) ?? screenSize.width,
+      height: finiteNumberOrNull(instance.height) ?? screenSize.height
+    };
+    nextInstances = currentInstances.map((item) =>
+      item?.id === instance.id ? nextInstance : item
+    );
+  } else {
+    nextInstance = {
+      id: crypto.randomUUID(),
+      sourceScreen: screenName,
+      type: "SCREEN_INSTANCE",
+      x: desired.x,
+      y: desired.y,
+      width: screenSize.width,
+      height: screenSize.height
+    };
+    nextInstances = [...currentInstances, nextInstance];
+  }
+
+  const patched = await patchProjectScreenInstances(
+    env,
+    stitchAuth,
+    projectId,
+    nextInstances
+  );
+
+  if (!patched.ok) {
+    return {
+      instanceCreated: Boolean(instance),
+      placementApplied: false,
+      instance: summarizeScreenInstance(instance),
+      reason: patched.reason
+    };
+  }
+
+  const verified = await getProjectSnapshot(
+    request,
+    env,
+    stitchAuth,
+    projectId
+  );
+  const verifiedInstance =
+    findInstanceById(verified.screenInstances, nextInstance.id) ||
+    findInstanceForScreen(verified.screenInstances, screenName);
+
+  if (!verifiedInstance) {
+    return {
+      instanceCreated: false,
+      placementApplied: false,
+      reason:
+        "Canvas PATCH returned success, but get_project still does not contain a screenInstance for the uploaded screen."
+    };
+  }
+
+  const xOk = Math.abs(Number(verifiedInstance.x) - desired.x) < 0.001;
+  const yOk = Math.abs(Number(verifiedInstance.y) - desired.y) < 0.001;
+
+  if (!xOk || !yOk) {
+    return {
+      instanceCreated: true,
+      placementApplied: false,
+      instance: summarizeScreenInstance(verifiedInstance),
+      reason:
+        "Canvas PATCH returned success, but get_project did not report the requested x/y coordinates."
+    };
+  }
+
+  return {
+    instanceCreated: true,
+    placementApplied: true,
+    placementMode: placement?.mode || "asset_area",
+    instance: summarizeScreenInstance(verifiedInstance)
+  };
+}
+
+async function getProjectSnapshot(request, env, stitchAuth, projectId) {
+  const callResult = await callUpstreamTool(
+    request,
+    env,
+    stitchAuth,
+    "get_project",
+    { name: `projects/${projectId}` }
+  );
+  const project = findObjectWithScreenInstances(callResult);
+  return {
+    project,
+    screenInstances: Array.isArray(project?.screenInstances)
+      ? project.screenInstances
+      : []
+  };
+}
+
+function findObjectWithScreenInstances(value, depth = 0) {
+  if (!value || depth > 10) return null;
+
+  if (typeof value === "object" && !Array.isArray(value)) {
+    if (Array.isArray(value.screenInstances)) return value;
+
+    if (Array.isArray(value.content)) {
+      for (const item of value.content) {
+        if (item?.type === "text" && typeof item.text === "string") {
+          try {
+            const parsed = JSON.parse(item.text);
+            const found = findObjectWithScreenInstances(parsed, depth + 1);
+            if (found) return found;
+          } catch {
+            // Ignore non-JSON tool text.
+          }
+        }
+      }
+    }
+
+    for (const child of Object.values(value)) {
+      const found = findObjectWithScreenInstances(child, depth + 1);
+      if (found) return found;
+    }
+  }
+
+  if (Array.isArray(value)) {
+    for (const child of value) {
+      const found = findObjectWithScreenInstances(child, depth + 1);
+      if (found) return found;
+    }
+  }
+
+  return null;
+}
+
+function findInstanceForScreen(instances, screenName) {
+  if (!Array.isArray(instances)) return null;
+  const screenId = String(screenName).split("/screens/")[1] || screenName;
+  return (
+    instances.find((item) => item?.sourceScreen === screenName) ||
+    instances.find((item) =>
+      typeof item?.sourceScreen === "string"
+        ? item.sourceScreen.endsWith(`/screens/${screenId}`)
+        : false
+    ) ||
+    null
+  );
+}
+
+function findInstanceById(instances, id) {
+  if (!Array.isArray(instances) || !id) return null;
+  return instances.find((item) => item?.id === id) || null;
+}
+
+function normalizePlacement(value) {
+  if (value === undefined || value === null) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("placement must be an object");
+  }
+
+  const mode = String(value.mode || "");
+  if (!["near_screen", "absolute", "asset_area", "auto"].includes(mode)) {
+    throw new Error(
+      "placement.mode must be near_screen, absolute, asset_area, or auto"
+    );
+  }
+
+  const gap = value.gap === undefined ? 40 : Number(value.gap);
+  if (!Number.isFinite(gap) || gap < 0 || gap > 2000) {
+    throw new Error("placement.gap must be between 0 and 2000");
+  }
+
+  const align = value.align || "top";
+  if (!["top", "center", "bottom"].includes(align)) {
+    throw new Error("placement.align must be top, center, or bottom");
+  }
+
+  if (mode === "near_screen" && !value.screenId) {
+    throw new Error("placement.screenId is required for near_screen mode");
+  }
+
+  if (
+    mode === "absolute" &&
+    (!Number.isFinite(Number(value.x)) || !Number.isFinite(Number(value.y)))
+  ) {
+    throw new Error("placement.x and placement.y are required for absolute mode");
+  }
+
+  return {
+    mode,
+    screenId: value.screenId ? String(value.screenId) : null,
+    gap,
+    align,
+    x: value.x === undefined ? null : Number(value.x),
+    y: value.y === undefined ? null : Number(value.y)
+  };
+}
+
+async function resolvePlacement(
+  request,
+  env,
+  stitchAuth,
+  projectId,
+  placement,
+  screenInstances,
+  newScreenName,
+  newSize
+) {
+  const boxes = normalizeCanvasBoxes(screenInstances).filter(
+    (box) => box.sourceScreen !== newScreenName
+  );
+
+  if (placement.mode === "absolute") {
+    return { x: placement.x, y: placement.y };
+  }
+
+  if (placement.mode === "near_screen") {
+    const target = findInstanceForScreen(
+      screenInstances,
+      `projects/${projectId}/screens/${placement.screenId}`
+    );
+    if (!target) {
+      throw new Error(
+        `Target screen ${placement.screenId} has no screenInstance in get_project`
+      );
+    }
+    return placeNearBox(target, newSize, boxes, placement.gap, placement.align);
+  }
+
+  let screens = [];
+  try {
+    const callResult = await callUpstreamTool(
+      request,
+      env,
+      stitchAuth,
+      "list_screens",
+      { projectId }
+    );
+    screens = extractScreenObjects(callResult);
+  } catch {
+    // Placement can still work using project.screenInstances only.
+  }
+
+  if (placement.mode === "auto") {
+    if (placement.screenId) {
+      const target = findInstanceForScreen(
+        screenInstances,
+        `projects/${projectId}/screens/${placement.screenId}`
+      );
+      if (target) {
+        return placeNearBox(
+          target,
+          newSize,
+          boxes,
+          placement.gap,
+          placement.align
+        );
+      }
+    }
+
+    const recentImage = screens
+      .filter(
+        (screen) =>
+          screen?.screenType === "IMAGE" &&
+          screen?.name &&
+          screen.name !== newScreenName
+      )
+      .sort((a, b) => {
+        const at = Date.parse(a.updateTime || a.createTime || 0) || 0;
+        const bt = Date.parse(b.updateTime || b.createTime || 0) || 0;
+        return bt - at;
+      })
+      .find((screen) => findInstanceForScreen(screenInstances, screen.name));
+
+    if (recentImage) {
+      const target = findInstanceForScreen(screenInstances, recentImage.name);
+      return placeNearBox(
+        target,
+        newSize,
+        boxes,
+        placement.gap,
+        placement.align
+      );
+    }
+  }
+
+  return placeInAssetArea(
+    newSize,
+    boxes,
+    screens,
+    placement.gap
+  );
+}
+
+function extractScreenObjects(value) {
+  const out = [];
+  const seen = new Set();
+
+  function visit(node, depth = 0) {
+    if (!node || depth > 10) return;
+
+    if (typeof node === "object" && !Array.isArray(node)) {
+      if (
+        typeof node.name === "string" &&
+        node.name.includes("/screens/") &&
+        !seen.has(node.name)
+      ) {
+        seen.add(node.name);
+        out.push(node);
+      }
+
+      if (Array.isArray(node.content)) {
+        for (const item of node.content) {
+          if (item?.type === "text" && typeof item.text === "string") {
+            try {
+              visit(JSON.parse(item.text), depth + 1);
+            } catch {
+              // Ignore non-JSON tool text.
+            }
+          }
+        }
+      }
+
+      for (const child of Object.values(node)) visit(child, depth + 1);
+      return;
+    }
+
+    if (Array.isArray(node)) {
+      for (const child of node) visit(child, depth + 1);
+    }
+  }
+
+  visit(value);
+  return out;
+}
+
+function normalizeCanvasBoxes(instances) {
+  if (!Array.isArray(instances)) return [];
+  return instances
+    .map((item) => ({
+      id: item?.id ?? null,
+      sourceScreen: item?.sourceScreen ?? null,
+      x: finiteNumberOrNull(item?.x),
+      y: finiteNumberOrNull(item?.y),
+      width: finiteNumberOrNull(item?.width),
+      height: finiteNumberOrNull(item?.height)
+    }))
+    .filter(
+      (item) =>
+        item.x !== null &&
+        item.y !== null &&
+        item.width !== null &&
+        item.height !== null &&
+        item.width > 0 &&
+        item.height > 0
+    );
+}
+
+function placeNearBox(target, size, boxes, gap, align) {
+  const t = normalizeCanvasBoxes([target])[0];
+  if (!t) throw new Error("Target screenInstance has invalid canvas geometry");
+
+  const alignedY =
+    align === "center"
+      ? t.y + (t.height - size.height) / 2
+      : align === "bottom"
+        ? t.y + t.height - size.height
+        : t.y;
+
+  const candidates = [
+    { x: t.x + t.width + gap, y: alignedY },
+    { x: t.x, y: t.y + t.height + gap }
+  ];
+
+  for (let row = 1; row <= 8; row++) {
+    candidates.push({
+      x: t.x + t.width + gap,
+      y: alignedY + row * (size.height + gap)
+    });
+    candidates.push({
+      x: t.x,
+      y: t.y + t.height + gap + row * (size.height + gap)
+    });
+  }
+
+  return firstFreePosition(candidates, size, boxes, gap);
+}
+
+function placeInAssetArea(size, boxes, screens, gap) {
+  if (!boxes.length) return { x: 0, y: 0 };
+
+  const imageNames = new Set(
+    screens
+      .filter((screen) => screen?.screenType === "IMAGE" && screen?.name)
+      .map((screen) => screen.name)
+  );
+  const candidates =
+    imageNames.size > 0
+      ? boxes.filter((box) => imageNames.has(box.sourceScreen))
+      : boxes;
+  const pool = candidates.length ? candidates : boxes;
+
+  let anchor = pool[0];
+  let bestDensity = -1;
+  for (const box of pool) {
+    const cx = box.x + box.width / 2;
+    const cy = box.y + box.height / 2;
+    let density = 0;
+    for (const other of pool) {
+      const ox = other.x + other.width / 2;
+      const oy = other.y + other.height / 2;
+      if (Math.hypot(cx - ox, cy - oy) <= 2200) density++;
+    }
+    if (density > bestDensity) {
+      bestDensity = density;
+      anchor = box;
+    }
+  }
+
+  const acx = anchor.x + anchor.width / 2;
+  const acy = anchor.y + anchor.height / 2;
+  const local = pool.filter((box) => {
+    const cx = box.x + box.width / 2;
+    const cy = box.y + box.height / 2;
+    return Math.hypot(acx - cx, acy - cy) <= 2200;
+  });
+
+  const minX = Math.min(...local.map((b) => b.x));
+  const maxX = Math.max(...local.map((b) => b.x + b.width));
+  const minY = Math.min(...local.map((b) => b.y));
+  const maxY = Math.max(...local.map((b) => b.y + b.height));
+
+  const positions = [
+    { x: maxX + gap, y: minY },
+    { x: minX, y: maxY + gap }
+  ];
+
+  const columns = Math.max(
+    1,
+    Math.floor(Math.max(1, maxX - minX) / Math.max(1, size.width + gap))
+  );
+  for (let i = 0; i < 16; i++) {
+    positions.push({
+      x: minX + (i % columns) * (size.width + gap),
+      y: maxY + gap + Math.floor(i / columns) * (size.height + gap)
+    });
+  }
+
+  return firstFreePosition(positions, size, boxes, gap);
+}
+
+function firstFreePosition(candidates, size, boxes, gap) {
+  for (const candidate of candidates) {
+    const rect = { ...candidate, width: size.width, height: size.height };
+    const collides = boxes.some((box) => boxesOverlap(rect, box, gap / 4));
+    if (!collides) return candidate;
+  }
+
+  const fallback = candidates[candidates.length - 1] || { x: 0, y: 0 };
+  return {
+    x: fallback.x,
+    y: fallback.y + size.height + gap
+  };
+}
+
+function boxesOverlap(a, b, margin = 0) {
+  return !(
+    a.x + a.width + margin <= b.x ||
+    b.x + b.width + margin <= a.x ||
+    a.y + a.height + margin <= b.y ||
+    b.y + b.height + margin <= a.y
+  );
+}
+
+function canvasDisplaySize(width, height) {
+  const w = Number(width);
+  const h = Number(height);
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) {
+    return { width: 512, height: 512 };
+  }
+  const scale = Math.min(1, 512 / Math.max(w, h));
+  return {
+    width: Math.max(1, Math.round(w * scale)),
+    height: Math.max(1, Math.round(h * scale))
+  };
+}
+
+async function patchProjectScreenInstances(
+  env,
+  stitchAuth,
+  projectId,
+  screenInstances
+) {
+  const endpoint =
+    `${stitchApiBaseUrl(env)}/v1/projects/${encodeURIComponent(projectId)}?updateMask=screenInstances`;
+
+  const response = await fetch(endpoint, {
+    method: "PATCH",
+    headers: buildGoogleRequestHeaders(stitchAuth, {
+      "content-type": "application/json",
+      accept: "application/json"
+    }),
+    body: JSON.stringify({ screenInstances })
+  });
+
+  const raw = await response.text();
+  if (!response.ok) {
+    const authHint =
+      stitchAuth?.type === "apiKey" && (response.status === 401 || response.status === 403)
+        ? " Stitch canvas PATCH is known to require OAuth for some accounts even when BatchCreateScreens accepts API keys."
+        : "";
+    return {
+      ok: false,
+      reason:
+        `Stitch canvas PATCH failed: HTTP ${response.status}: ${truncate(raw, 800)}.${authHint}`
+    };
+  }
+
+  return { ok: true };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function fetchImageAsset(rawUrl, width, env) {
-  const assetUrl = buildStitchAssetUrl(rawUrl, width);
+  const normalizedWidth = normalizeWidth(width);
+  const sourceUrl = buildStitchAssetUrl(rawUrl, null);
+
+  if (!normalizedWidth) {
+    return downloadStitchImage(
+      sourceUrl,
+      env,
+      "image/png,image/webp,image/jpeg,image/*;q=0.8,*/*;q=0.2",
+      { resizeRequested: null, resizeApplied: false }
+    );
+  }
+
+  const source = await downloadStitchImage(
+    sourceUrl,
+    env,
+    "image/png,image/webp,image/jpeg,image/*;q=0.8,*/*;q=0.2",
+    { resizeRequested: normalizedWidth, resizeApplied: false }
+  );
+  const resizedUrl = buildStitchAssetUrl(rawUrl, normalizedWidth);
+  if (resizedUrl === sourceUrl) return source;
+
+  const sourceMetadata = detectImageMetadata(source.bytes, source.mimeType);
+  const preferPng = sourceMetadata.format === "png";
+  const resized = await downloadStitchImage(
+    resizedUrl,
+    env,
+    preferPng
+      ? "image/png,image/*;q=0.5,*/*;q=0.1"
+      : "image/webp,image/jpeg,image/png,image/*;q=0.8,*/*;q=0.2",
+    { resizeRequested: normalizedWidth, resizeApplied: true }
+  );
+  const resizedMetadata = detectImageMetadata(resized.bytes, resized.mimeType);
+
+  if (preferPng && resizedMetadata.format !== "png") {
+    return {
+      ...source,
+      resizeRequested: normalizedWidth,
+      resizeApplied: false,
+      resizeFallbackReason:
+        `Resize response changed PNG to ${resized.mimeType}; returned original PNG bytes instead.`
+    };
+  }
+
+  return resized;
+}
+
+async function downloadStitchImage(assetUrl, env, accept, extra = {}) {
   const response = await fetch(assetUrl, {
     method: "GET",
     headers: {
-      accept: "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
-      "user-agent": "stitch-mcp-proxy/1.0"
+      accept,
+      "user-agent": "stitch-mcp-proxy/2.3"
     },
     redirect: "follow"
   });
@@ -1019,7 +1822,6 @@ async function fetchImageAsset(rawUrl, width, env) {
 
   const contentTypeHeader = response.headers.get("content-type") || "";
   const contentType = contentTypeHeader.split(";")[0].trim().toLowerCase();
-
   if (!contentType.startsWith("image/")) {
     throw new Error(
       `Stitch asset is not an image. Content-Type: ${contentTypeHeader || "unknown"}`
@@ -1028,17 +1830,21 @@ async function fetchImageAsset(rawUrl, width, env) {
 
   const buffer = await response.arrayBuffer();
   enforceMaxImageBytes(buffer.byteLength, env);
+  const bytes = new Uint8Array(buffer);
+  const detectedMime = detectUploadMime(bytes);
 
   return {
     requestedUrl: assetUrl,
     finalUrl: response.url || assetUrl,
-    mimeType: normalizeImageMime(contentType),
-    bytes: new Uint8Array(buffer),
-    cacheControl: response.headers.get("cache-control") || null
+    mimeType: detectedMime || normalizeImageMime(contentType),
+    bytes,
+    cacheControl: response.headers.get("cache-control") || null,
+    ...extra
   };
 }
 
 function imageToolContent(asset, sourceUrl, extra = {}) {
+  const metadata = detectImageMetadata(asset.bytes, asset.mimeType);
   return [
     {
       type: "text",
@@ -1049,6 +1855,14 @@ function imageToolContent(asset, sourceUrl, extra = {}) {
         finalUrl: asset.finalUrl,
         mimeType: asset.mimeType,
         bytes: asset.bytes.byteLength,
+        format: metadata.format ?? null,
+        width: metadata.width ?? null,
+        height: metadata.height ?? null,
+        hasAlpha: metadata.hasAlpha ?? null,
+        nativeAlphaChannel: metadata.nativeAlphaChannel ?? null,
+        resizeRequested: asset.resizeRequested ?? null,
+        resizeApplied: asset.resizeApplied ?? false,
+        resizeFallbackReason: asset.resizeFallbackReason ?? null,
         ...extra
       })
     },
@@ -1083,7 +1897,8 @@ function detectImageMetadata(bytes, mimeType) {
     format: mimeType || "unknown",
     width: null,
     height: null,
-    hasAlpha: null
+    hasAlpha: null,
+    nativeAlphaChannel: null
   };
 }
 
@@ -1094,7 +1909,7 @@ function isPng(bytes) {
 
 function inspectPng(bytes) {
   if (bytes.length < 33) {
-    return { format: "png", width: null, height: null, hasAlpha: null };
+    return { format: "png", width: null, height: null, hasAlpha: null, nativeAlphaChannel: null };
   }
 
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -1169,13 +1984,13 @@ function inspectJpeg(bytes) {
     if (isSof && length >= 7) {
       const height = (bytes[offset + 3] << 8) | bytes[offset + 4];
       const width = (bytes[offset + 5] << 8) | bytes[offset + 6];
-      return { format: "jpeg", width, height, hasAlpha: false };
+      return { format: "jpeg", width, height, hasAlpha: false, nativeAlphaChannel: false };
     }
 
     offset += length;
   }
 
-  return { format: "jpeg", width: null, height: null, hasAlpha: false };
+  return { format: "jpeg", width: null, height: null, hasAlpha: false, nativeAlphaChannel: false };
 }
 
 function isWebp(bytes) {
@@ -1188,7 +2003,7 @@ function isWebp(bytes) {
 
 function inspectWebp(bytes) {
   if (bytes.length < 30) {
-    return { format: "webp", width: null, height: null, hasAlpha: null };
+    return { format: "webp", width: null, height: null, hasAlpha: null, nativeAlphaChannel: null };
   }
 
   const chunk = ascii(bytes, 12, 4);
@@ -1198,10 +2013,10 @@ function inspectWebp(bytes) {
     const hasAlpha = Boolean(flags & 0x10);
     const width = 1 + bytes[24] + (bytes[25] << 8) + (bytes[26] << 16);
     const height = 1 + bytes[27] + (bytes[28] << 8) + (bytes[29] << 16);
-    return { format: "webp", width, height, hasAlpha };
+    return { format: "webp", width, height, hasAlpha, nativeAlphaChannel: hasAlpha };
   }
 
-  return { format: "webp", width: null, height: null, hasAlpha: null };
+  return { format: "webp", width: null, height: null, hasAlpha: null, nativeAlphaChannel: null };
 }
 
 function ascii(bytes, offset, length) {
