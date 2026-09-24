@@ -32,15 +32,17 @@
 
 你的 Google Stitch API Key。
 
-### `BRIDGE_KEY`
+### `BRIDGE_KEY` / `PROXY_TOKEN`
 
-你自己生成的一串长随机密码，用来保护这个 Worker，例如：
+两者都可以作为 Worker 的访问密钥。新配置推荐使用 `BRIDGE_KEY`；旧配置中的 `PROXY_TOKEN` 会继续兼容，不需要改名或重新生成。
+
+例如：
 
 ```text
 stitch_bridge_请换成一串随机长密码
 ```
 
-不要把这两个值提交到 GitHub。
+不要把这些 Secret 提交到 GitHub。
 
 > 兼容旧配置：如果你不设置 `STITCH_API_KEY`，Worker 仍可接受客户端传入的 `X-Goog-Api-Key`。但推荐使用 Cloudflare Secret。
 
@@ -78,16 +80,32 @@ curl https://YOUR-WORKER.workers.dev/health
 
 ## 4. ChatGPT / MCP 配置
 
-MCP URL：
+MCP URL（推荐给单人/私有 ChatGPT Dev MCP，兼容旧配置）：
+
+```text
+https://YOUR-WORKER.workers.dev/mcp/你的_TOKEN
+```
+
+其中 TOKEN 可以是 Cloudflare 中配置的 `PROXY_TOKEN` 或 `BRIDGE_KEY`。
+
+也支持不把 token 放进 URL，改用：
 
 ```text
 https://YOUR-WORKER.workers.dev/mcp
 ```
 
-请求头：
+并携带请求头：
 
 ```text
 X-Bridge-Key: 你的 BRIDGE_KEY
+```
+
+另外也兼容：
+
+```text
+Authorization: Bearer 你的_TOKEN
+X-Proxy-Token: 你的_TOKEN
+https://YOUR-WORKER.workers.dev/mcp?token=你的_TOKEN
 ```
 
 如果你没有设置 Cloudflare `STITCH_API_KEY` secret，则还需要：
@@ -150,16 +168,14 @@ Worker 只允许图片桥接访问以下主机：
 
 避免把它变成任意 URL SSRF 代理。
 
-如果设置了 `BRIDGE_KEY`，所有 `/mcp` 请求必须提供：
+如果设置了 `BRIDGE_KEY` 或 `PROXY_TOKEN`，MCP 请求必须通过任一受支持方式提供正确 token：
 
 ```text
-X-Bridge-Key: xxx
-```
-
-或者：
-
-```text
-Authorization: Bearer xxx
+/mcp/<token>
+/mcp?token=<token>
+X-Bridge-Key: <token>
+X-Proxy-Token: <token>
+Authorization: Bearer <token>
 ```
 
 ## 7. 关于“透明背景 + 回传 Stitch”
