@@ -1,6 +1,7 @@
 name = "stitch-mcp-proxy"
 main = "src/index.js"
 compatibility_date = "2026-09-24"
+keep_vars = true
 
 # Secrets (set in Cloudflare, DO NOT commit values):
 #   STITCH_API_KEY = Google Stitch API key
