@@ -4,12 +4,14 @@
 
 
 - 代理 Google Stitch 官方 MCP：`https://stitch.googleapis.com/mcp`
-- 服务端注入 `X-Goog-Api-Key`
+- 支持 Stitch API Key，也支持 Google OAuth Bearer 透传
 - 保留 Stitch 原有所有工具
 - 新增 `fetch_stitch_screen_image`
 - 新增 `fetch_stitch_image`
 - 新增 `inspect_stitch_screen_image`
 - 新增 `inspect_stitch_image`
+- 新增 `upload_stitch_image`
+- 新增 `upload_stitch_image_from_url`
 
 这解决了一个实际问题：Stitch 的 `get_screen` 返回 `screenshot.downloadUrl`，但某些 Agent/运行环境不能直接访问 Google 图片 CDN。这个 Worker 在 Cloudflare 侧下载真实图片字节，再通过 MCP `image` content 返回给模型。
 
@@ -30,7 +32,19 @@
 
 ### `STITCH_API_KEY`
 
-你的 Google Stitch API Key。
+你的 Google Stitch API Key。API Key 模式下最简单，Cloudflare 端保存即可。
+
+### `STITCH_ACCESS_TOKEN`（可选）
+
+Google OAuth access token。只建议临时测试，因为 access token 会过期；正式使用更推荐让 MCP 客户端通过 `Authorization: Bearer <token>` 动态传入。
+
+OAuth scope 使用：
+
+```text
+https://www.googleapis.com/auth/aida
+```
+
+OAuth 模式建议同时设置普通变量 `STITCH_PROJECT_ID`（或 `GOOGLE_CLOUD_PROJECT`），Worker 会将其作为 `X-Goog-User-Project` 转发给 Google。
 
 ### `BRIDGE_KEY` / `PROXY_TOKEN`
 
@@ -114,7 +128,20 @@ https://YOUR-WORKER.workers.dev/mcp?token=你的_TOKEN
 X-Goog-Api-Key: 你的 Stitch API Key
 ```
 
-推荐把 Stitch Key 放 Cloudflare secret，因此 ChatGPT 端只需要 `X-Bridge-Key`。
+推荐把 Stitch Key 放 Cloudflare secret，因此 API Key 模式下 ChatGPT 端只需要桥接鉴权。
+
+### OAuth 透传模式
+
+如果 ChatGPT / MCP 客户端使用 Google OAuth，请把桥接鉴权和 Google OAuth 分开：
+
+```text
+https://YOUR-WORKER.workers.dev/mcp/你的_BRIDGE_TOKEN
+Authorization: Bearer <Google OAuth access token>
+```
+
+不要再用 `Authorization: Bearer <BRIDGE_KEY>` 保护 Worker，否则同一个 Authorization 头无法同时承载 Google OAuth。桥接密码请放路径、`?token=`、`X-Bridge-Key` 或 `X-Proxy-Token`。
+
+当请求还没有 Google 凭据时，Worker 会把请求原样转给官方 Stitch MCP，让 Google 返回真实 OAuth challenge，而不是本地伪造 initialize 成功。
 
 ## 5. 新增工具
 
@@ -178,10 +205,27 @@ X-Proxy-Token: <token>
 Authorization: Bearer <token>
 ```
 
-## 7. 关于“透明背景 + 回传 Stitch”
+## 7. 图片上传
 
-这个版本首先把最关键的 **Stitch → Agent 原始图片数据链路** 打通。
+当前 Worker 已实现两种上传方式：
 
-Google Stitch SDK 当前提供 `project.uploadImage()`，可以把 PNG/JPG/WEBP 上传成 Stitch screen；后续如果需要，可以继续在同一个 Worker 增加“图片处理 + 上传”工具，而不需要再建第二个 Worker。
+- `upload_stitch_image`：直接传 base64 图片字节
+- `upload_stitch_image_from_url`：Worker 先下载公开 HTTPS 图片，再上传到 Stitch
 
-当前这版不伪造未验证的上传 REST endpoint，避免因为 Stitch API 变化导致 Worker 看似部署成功、实际上传失败。
+支持 PNG / JPG / JPEG / WEBP，调用与官方 `@google/stitch-sdk` 一致的 REST 路径：
+
+```text
+POST https://stitch.googleapis.com/v1/projects/{projectId}/screens:batchCreate
+```
+
+上传请求会复用当前 Stitch 鉴权：有 Google OAuth 时发送 Bearer + `X-Goog-User-Project`，否则使用 `X-Goog-Api-Key`。
+
+## 8. 关于“透明背景 + 回传 Stitch”
+
+现在完整链路已经具备：
+
+```text
+Stitch -> Agent 获取原图 -> 处理 PNG/透明通道 -> upload_stitch_image -> Stitch
+```
+
+Worker 本身不负责抠图或生成透明通道，只负责把真实图片字节可靠地取回和上传。
