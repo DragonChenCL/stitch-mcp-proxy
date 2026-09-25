@@ -26,7 +26,7 @@
  *   X-Goog-Api-Key header will still be accepted and forwarded.
  */
 
-const PROXY_VERSION = "2026-09-24-image-bridge-v2.3-canvas-placement";
+const PROXY_VERSION = "2026-09-25-image-bridge-v2.4-background-removal";
 const DEFAULT_STITCH_MCP_URL = "https://stitch.googleapis.com/mcp";
 const DEFAULT_STITCH_API_URL = "https://stitch.googleapis.com";
 const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -173,6 +173,17 @@ const LOCAL_TOOLS = [
         url: {
           type: "string",
           description: "Public HTTPS URL of a PNG, JPEG, or WEBP image."
+        },
+        removeBackground: {
+          type: "boolean",
+          description:
+            "Remove the image background before uploading. The result is uploaded as a transparent PNG at the source pixel dimensions."
+        },
+        backgroundModel: {
+          type: "string",
+          enum: ["fast", "hd"],
+          description:
+            "Background-removal model. Defaults to hd for cleaner watercolor/fur edges."
         },
         title: {
           type: "string",
@@ -613,9 +624,22 @@ async function handleLocalTool(request, env, stitchAuth, rpc) {
 
     if (name === "upload_stitch_image_from_url") {
       const projectId = requireBareId(args.projectId, "projectId");
-      const asset = await fetchRemoteUploadImage(args.url, env);
+      const marker = parseBackgroundRemovalMarker(args.url);
+      const shouldRemoveBackground =
+        args.removeBackground === true || marker.removeBackground;
+      const sourceAsset = await fetchRemoteUploadImage(marker.cleanUrl, env);
+      const asset = shouldRemoveBackground
+        ? await removeImageBackground(
+            sourceAsset,
+            args.backgroundModel || marker.model || "hd",
+            env
+          )
+        : sourceAsset;
       const sourceMetadata = detectImageMetadata(asset.bytes, asset.mimeType);
-      enforceUploadImagePolicy(asset.mimeType, sourceMetadata, args);
+      enforceUploadImagePolicy(asset.mimeType, sourceMetadata, {
+        ...args,
+        backgroundRemoved: shouldRemoveBackground || args.backgroundRemoved === true
+      });
       const uploaded = await uploadImageToStitch(
         request,
         env,
@@ -627,7 +651,8 @@ async function handleLocalTool(request, env, stitchAuth, rpc) {
           title: args.title,
           createScreenInstances: args.createScreenInstances,
           preserveOriginalSize: args.preserveOriginalSize,
-          backgroundRemoved: args.backgroundRemoved,
+          backgroundRemoved:
+            shouldRemoveBackground || args.backgroundRemoved === true,
           placement: args.placement,
           sourceMetadata
         }
@@ -640,7 +665,10 @@ async function handleLocalTool(request, env, stitchAuth, rpc) {
             {
               ok: true,
               projectId,
-              sourceUrl: asset.finalUrl,
+              sourceUrl: sourceAsset.finalUrl,
+              processedUrl: asset.finalUrl,
+              backgroundRemoved: shouldRemoveBackground,
+              backgroundModel: asset.backgroundModel || null,
               mimeType: asset.mimeType,
               bytes: asset.bytes.byteLength,
               ...uploaded
@@ -863,6 +891,103 @@ function findObjectWithScreenshot(value, depth = 0) {
   }
 
   return null;
+}
+
+function parseBackgroundRemovalMarker(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") {
+    return { cleanUrl: rawUrl, removeBackground: false, model: null };
+  }
+
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return { cleanUrl: rawUrl, removeBackground: false, model: null };
+  }
+
+  const marker = String(url.hash || "").toLowerCase();
+  const removeBackground =
+    marker === "#remove-background" ||
+    marker === "#remove-background-hd" ||
+    marker === "#remove-background-fast";
+  const model = marker.endsWith("-fast")
+    ? "fast"
+    : marker.endsWith("-hd") || marker === "#remove-background"
+      ? "hd"
+      : null;
+
+  if (removeBackground) url.hash = "";
+  return {
+    cleanUrl: url.toString(),
+    removeBackground,
+    model
+  };
+}
+
+async function removeImageBackground(asset, model, env) {
+  const normalizedModel = model === "fast" ? "fast" : "hd";
+  const endpoint =
+    "https://clearbackdrop.com/api/v1/remove-background?model=" +
+    encodeURIComponent(normalizedModel);
+
+  const form = new FormData();
+  form.append(
+    "image",
+    new Blob([asset.bytes], { type: asset.mimeType }),
+    `stitch-source.${asset.mimeType === "image/png" ? "png" : asset.mimeType === "image/webp" ? "webp" : "jpg"}`
+  );
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    body: form,
+    headers: {
+      accept: "image/png"
+    }
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Background removal failed: HTTP ${response.status}: ${truncate(errorText, 800)}`
+    );
+  }
+
+  const buffer = await response.arrayBuffer();
+  enforceMaxImageBytes(buffer.byteLength, env);
+  const bytes = new Uint8Array(buffer);
+  const metadata = detectImageMetadata(bytes, "image/png");
+
+  if (!isPng(bytes)) {
+    throw new Error("Background removal returned a non-PNG payload.");
+  }
+  if (metadata.hasAlpha !== true) {
+    throw new Error(
+      "Background removal returned PNG bytes but no alpha channel was detected."
+    );
+  }
+
+  const sourceMetadata = detectImageMetadata(asset.bytes, asset.mimeType);
+  if (
+    sourceMetadata.width &&
+    sourceMetadata.height &&
+    metadata.width &&
+    metadata.height &&
+    (sourceMetadata.width !== metadata.width ||
+      sourceMetadata.height !== metadata.height)
+  ) {
+    throw new Error(
+      `Background removal changed image dimensions from ${sourceMetadata.width}x${sourceMetadata.height} to ${metadata.width}x${metadata.height}; refusing to upload a resized result.`
+    );
+  }
+
+  return {
+    requestedUrl: asset.requestedUrl,
+    finalUrl: asset.finalUrl,
+    mimeType: "image/png",
+    bytes,
+    cacheControl: null,
+    backgroundModel: response.headers.get("x-model-used") || normalizedModel
+  };
 }
 
 async function fetchRemoteUploadImage(rawUrl, env) {
@@ -1879,6 +2004,7 @@ function inspectImage(asset) {
 
   return {
     ok: true,
+    proxyVersion: PROXY_VERSION,
     fetchedUrl: asset.requestedUrl,
     finalUrl: asset.finalUrl,
     mimeType: asset.mimeType,

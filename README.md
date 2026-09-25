@@ -343,3 +343,33 @@ BatchCreateScreens(createScreenInstances=true)
 - `nativeAlphaChannel`
 
 工具：`fetch_stitch_image`、`fetch_stitch_screen_image`、`inspect_stitch_image`、`inspect_stitch_screen_image`。
+
+
+## 10. 一键去背景后回传 Stitch
+
+`upload_stitch_image_from_url` 新增：
+
+```json
+{
+  "removeBackground": true,
+  "backgroundModel": "hd"
+}
+```
+
+去背景通过 ClearBackdrop 的背景分割服务执行，结果必须同时满足：
+
+- 输出为 PNG
+- 检测到 Alpha 通道
+- 输出宽高与下载到的源图片完全一致
+
+任意一项不满足都会中止，不会把错误结果上传到 Stitch。
+
+为兼容已经连接但 tool schema 还没有刷新的 MCP 客户端，URL fragment 临时支持：
+
+```text
+#remove-background
+#remove-background-hd
+#remove-background-fast
+```
+
+fragment 只作为代理侧标记，真正下载源图片前会被移除。

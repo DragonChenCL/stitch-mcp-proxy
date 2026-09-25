@@ -49,3 +49,12 @@ test("fetch responses expose unified image metadata", () => {
     assert.ok(source.includes(field), `missing metadata field: ${field}`);
   }
 });
+
+
+test("URL upload supports lossless background-removal bridge", () => {
+  assert.match(source, /removeBackground/);
+  assert.match(source, /clearbackdrop\.com\/api\/v1\/remove-background/);
+  assert.match(source, /Background removal changed image dimensions/);
+  assert.match(source, /metadata\.hasAlpha !== true/);
+  assert.match(source, /#remove-background/);
+});
