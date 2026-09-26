@@ -26,7 +26,7 @@
  *   X-Goog-Api-Key header will still be accepted and forwarded.
  */
 
-const PROXY_VERSION = "2026-09-25-image-bridge-v2.4-background-removal";
+const PROXY_VERSION = "2026-09-26-image-bridge-v2.5-clean-cutout-native-instance";
 const DEFAULT_STITCH_MCP_URL = "https://stitch.googleapis.com/mcp";
 const DEFAULT_STITCH_API_URL = "https://stitch.googleapis.com";
 const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -925,69 +925,94 @@ function parseBackgroundRemovalMarker(rawUrl) {
 }
 
 async function removeImageBackground(asset, model, env) {
-  const normalizedModel = model === "fast" ? "fast" : "hd";
-  const endpoint =
-    "https://clearbackdrop.com/api/v1/remove-background?model=" +
-    encodeURIComponent(normalizedModel);
-
-  const form = new FormData();
-  form.append(
-    "image",
-    new Blob([asset.bytes], { type: asset.mimeType }),
-    `stitch-source.${asset.mimeType === "image/png" ? "png" : asset.mimeType === "image/webp" ? "webp" : "jpg"}`
-  );
-
-  const response = await fetch(endpoint, {
-    method: "POST",
-    body: form,
-    headers: {
-      accept: "image/png"
-    }
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(
-      `Background removal failed: HTTP ${response.status}: ${truncate(errorText, 800)}`
-    );
-  }
-
-  const buffer = await response.arrayBuffer();
-  enforceMaxImageBytes(buffer.byteLength, env);
-  const bytes = new Uint8Array(buffer);
-  const metadata = detectImageMetadata(bytes, "image/png");
-
-  if (!isPng(bytes)) {
-    throw new Error("Background removal returned a non-PNG payload.");
-  }
-  if (metadata.hasAlpha !== true) {
-    throw new Error(
-      "Background removal returned PNG bytes but no alpha channel was detected."
-    );
-  }
-
   const sourceMetadata = detectImageMetadata(asset.bytes, asset.mimeType);
-  if (
-    sourceMetadata.width &&
-    sourceMetadata.height &&
-    metadata.width &&
-    metadata.height &&
-    (sourceMetadata.width !== metadata.width ||
-      sourceMetadata.height !== metadata.height)
-  ) {
-    throw new Error(
-      `Background removal changed image dimensions from ${sourceMetadata.width}x${sourceMetadata.height} to ${metadata.width}x${metadata.height}; refusing to upload a resized result.`
+  const providers = [
+    {
+      name: "bgninja",
+      endpoint: "https://bgninja.com/api/remove",
+      field: "file"
+    },
+    {
+      name: "clearbackdrop",
+      endpoint:
+        "https://clearbackdrop.com/api/v1/remove-background?model=" +
+        encodeURIComponent(model === "fast" ? "fast" : "hd"),
+      field: "image"
+    }
+  ];
+
+  const errors = [];
+  for (const provider of providers) {
+    const form = new FormData();
+    form.append(
+      provider.field,
+      new Blob([asset.bytes], { type: asset.mimeType }),
+      `stitch-source.${asset.mimeType === "image/png" ? "png" : asset.mimeType === "image/webp" ? "webp" : "jpg"}`
     );
+
+    let response;
+    try {
+      response = await fetch(provider.endpoint, {
+        method: "POST",
+        body: form,
+        headers: { accept: "image/png" }
+      });
+    } catch (error) {
+      errors.push(
+        `${provider.name}: ${error instanceof Error ? error.message : String(error)}`
+      );
+      continue;
+    }
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      errors.push(
+        `${provider.name}: HTTP ${response.status}: ${truncate(errorText, 500)}`
+      );
+      continue;
+    }
+
+    const buffer = await response.arrayBuffer();
+    enforceMaxImageBytes(buffer.byteLength, env);
+    const bytes = new Uint8Array(buffer);
+    const metadata = detectImageMetadata(bytes, "image/png");
+
+    if (!isPng(bytes)) {
+      errors.push(`${provider.name}: returned a non-PNG payload`);
+      continue;
+    }
+    if (metadata.hasAlpha !== true) {
+      errors.push(`${provider.name}: returned PNG without an alpha channel`);
+      continue;
+    }
+
+    if (
+      sourceMetadata.width &&
+      sourceMetadata.height &&
+      metadata.width &&
+      metadata.height &&
+      (sourceMetadata.width !== metadata.width ||
+        sourceMetadata.height !== metadata.height)
+    ) {
+      errors.push(
+        `${provider.name}: changed dimensions from ${sourceMetadata.width}x${sourceMetadata.height} to ${metadata.width}x${metadata.height}`
+      );
+      continue;
+    }
+
+    return {
+      requestedUrl: asset.requestedUrl,
+      finalUrl: asset.finalUrl,
+      mimeType: "image/png",
+      bytes,
+      cacheControl: null,
+      backgroundModel: provider.name
+    };
   }
 
-  return {
-    requestedUrl: asset.requestedUrl,
-    finalUrl: asset.finalUrl,
-    mimeType: "image/png",
-    bytes,
-    cacheControl: null,
-    backgroundModel: response.headers.get("x-model-used") || normalizedModel
-  };
+  throw new Error(
+    "Background removal failed across all providers: " + errors.join(" | ")
+  );
 }
 
 async function fetchRemoteUploadImage(rawUrl, env) {
@@ -1250,7 +1275,8 @@ async function uploadImageToStitch(
       projectId,
       screenName,
       sourceMetadata,
-      options.placement
+      options.placement,
+      options.backgroundRemoved === true && options.preserveOriginalSize !== false
     );
   }
 
@@ -1301,7 +1327,8 @@ async function ensureScreenInstancePlacement(
   projectId,
   screenName,
   sourceMetadata,
-  rawPlacement
+  rawPlacement,
+  forceNativeInstanceSize = false
 ) {
   const placement = normalizePlacement(rawPlacement);
   let snapshot = null;
@@ -1314,7 +1341,7 @@ async function ensureScreenInstancePlacement(
     if (attempt < 2) await sleep(250 * (attempt + 1));
   }
 
-  if (instance && !placement) {
+  if (instance && !placement && !forceNativeInstanceSize) {
     return {
       instanceCreated: true,
       placementApplied: null,
@@ -1326,23 +1353,35 @@ async function ensureScreenInstancePlacement(
     sourceMetadata.width,
     sourceMetadata.height
   );
-  const screenSize = {
-    width: finiteNumberOrNull(instance?.width) ?? fallbackSize.width,
-    height: finiteNumberOrNull(instance?.height) ?? fallbackSize.height
-  };
+  const screenSize = forceNativeInstanceSize
+    ? {
+        width: finiteNumberOrNull(sourceMetadata.width) ?? fallbackSize.width,
+        height: finiteNumberOrNull(sourceMetadata.height) ?? fallbackSize.height
+      }
+    : {
+        width: finiteNumberOrNull(instance?.width) ?? fallbackSize.width,
+        height: finiteNumberOrNull(instance?.height) ?? fallbackSize.height
+      };
 
   let desired;
   try {
-    desired = await resolvePlacement(
-      request,
-      env,
-      stitchAuth,
-      projectId,
-      placement || { mode: "asset_area", gap: 40, align: "top", screenId: null },
-      snapshot?.screenInstances || [],
-      screenName,
-      screenSize
-    );
+    if (!placement && instance) {
+      desired = {
+        x: finiteNumberOrNull(instance.x) ?? 0,
+        y: finiteNumberOrNull(instance.y) ?? 0
+      };
+    } else {
+      desired = await resolvePlacement(
+        request,
+        env,
+        stitchAuth,
+        projectId,
+        placement || { mode: "asset_area", gap: 40, align: "top", screenId: null },
+        snapshot?.screenInstances || [],
+        screenName,
+        screenSize
+      );
+    }
   } catch (error) {
     return {
       instanceCreated: Boolean(instance),
@@ -1364,8 +1403,12 @@ async function ensureScreenInstancePlacement(
       ...instance,
       x: desired.x,
       y: desired.y,
-      width: finiteNumberOrNull(instance.width) ?? screenSize.width,
-      height: finiteNumberOrNull(instance.height) ?? screenSize.height
+      width: forceNativeInstanceSize
+        ? screenSize.width
+        : finiteNumberOrNull(instance.width) ?? screenSize.width,
+      height: forceNativeInstanceSize
+        ? screenSize.height
+        : finiteNumberOrNull(instance.height) ?? screenSize.height
     };
     nextInstances = currentInstances.map((item) =>
       item?.id === instance.id ? nextInstance : item
